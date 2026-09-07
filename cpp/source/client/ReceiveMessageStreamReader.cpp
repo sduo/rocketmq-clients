@@ -16,6 +16,7 @@
  */
 
 #include "ReceiveMessageStreamReader.h"
+#include "FmtEnumFormatter.h"
 
 #include <chrono>
 
@@ -138,6 +139,10 @@ void ReceiveMessageStreamReader::OnReadDone(bool ok) {
     }
     case rmq::ReceiveMessageResponse::ContentCase::kMessage: {
       auto client_manager = client_manager_.lock();
+      if (!client_manager) {
+        SPDLOG_WARN("ClientManager has been destructed, dropping received message");
+        break;
+      }
       auto message = client_manager->wrapMessage(response_.message());
       auto raw = const_cast<Message*>(message.get());
       raw->mutableExtension().target_endpoint = peer_address_;

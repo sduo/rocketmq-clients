@@ -71,6 +71,8 @@ func (dpq *defaultProcessQueue) discardFifoMessage(mv *MessageView) {
 }
 
 func (dpq *defaultProcessQueue) eraseFifoMessage(mv *MessageView, result ConsumerResult) {
+	result = dpq.convertSuspendResultIfNeeded(result)
+
 	retryPolicy := dpq.consumer.pcSettings.GetRetryPolicy()
 	maxAttempts := retryPolicy.MaxAttempts
 	attempt := mv.GetMessageCommon().deliveryAttempt
@@ -78,7 +80,8 @@ func (dpq *defaultProcessQueue) eraseFifoMessage(mv *MessageView, result Consume
 	service := dpq.consumer.consumerService
 	clientId := dpq.consumer.cli.clientID
 
-	if result == FAILURE && attempt < maxAttempts {
+	// Handle FAILURE result with retry
+	if result.Type == ConsumerResultTypeFailure && attempt < maxAttempts {
 		nextAttemptDelay := utils.GetNextAttemptDelay(retryPolicy, int(attempt))
 		mv.deliveryAttempt += 1
 		attempt = mv.deliveryAttempt
@@ -91,16 +94,36 @@ func (dpq *defaultProcessQueue) eraseFifoMessage(mv *MessageView, result Consume
 		return
 	}
 
-	if result != SUCCESS {
-		dpq.consumer.cli.log.Infof("Failed to consume fifo message finally, run out of attempt times, maxAttempts=%d, "+
-			"attempt=%d, mq=%s, messageId=%s, clientId=%s", maxAttempts, attempt, dpq.mqstr, messageId, clientId)
-	}
-	// Ack message or forward it to DLQ depends on consumption result.
-	if result == SUCCESS {
+	// Handle SUCCESS result
+	if result.Type == ConsumerResultTypeSuccess {
 		dpq.ackMessage(mv, func(error) { dpq.evictCacheMessage(mv) })
-	} else {
-		dpq.forwardToDeadLetterQueue(mv, func(error) { dpq.evictCacheMessage(mv) })
+		return
 	}
+
+	// Handle SUSPEND result
+	if result.Type == ConsumerResultTypeSuspend {
+		dpq.consumer.cli.log.Infof("Suspend consumption, consumerGroup=%s, topic=%s, liteTopic=%s, messageId=%s, suspendTime=%v",
+			dpq.consumer.groupName, mv.topic, mv.GetLiteTopic(), messageId, result.suspendTime)
+		dpq.changeInvisibleDuration(mv, result.suspendTime, 1, func(error) { dpq.evictCacheMessage(mv) })
+		return
+	}
+
+	// Handle FAILURE result without retry (final failure)
+	dpq.consumer.cli.log.Infof("Failed to consume fifo message finally, run out of attempt times, maxAttempts=%d, "+
+		"attempt=%d, mq=%s, messageId=%s, clientId=%s", maxAttempts, attempt, dpq.mqstr, messageId, clientId)
+	dpq.forwardToDeadLetterQueue(mv, func(error) { dpq.evictCacheMessage(mv) })
+}
+
+func (dpq *defaultProcessQueue) convertSuspendResultIfNeeded(result ConsumerResult) ConsumerResult {
+	if result.Type == ConsumerResultTypeSuspend {
+		if dpq.consumer.pcSettings.clientType != v2.ClientType_LITE_PUSH_CONSUMER {
+			dpq.consumer.cli.log.Warnf("Only LitePushConsumer supports ConsumeResultSuspend! "+
+				"Convert to FAILURE, consumerGroup=%s, consumerType=%v",
+				dpq.consumer.groupName, dpq.consumer.pcSettings.clientType)
+			return FAILURE
+		}
+	}
+	return result
 }
 
 func (dpq *defaultProcessQueue) forwardToDeadLetterQueue(mv *MessageView, callback func(error)) {
@@ -131,6 +154,7 @@ func (dpq *defaultProcessQueue) forwardToDeadLetterQueue0(mv *MessageView, attem
 			" clientId=%s, consumerGroup=%s, messageId=%s, attempt=%d, mq=%s, endpoints=%v, requestId=%s, status message=[%s]", clientId, consumerGroup, messageId, attempt, dpq.mqstr,
 			endpoints, requestId, status.GetMessage())
 		dpq.forwardToDeadLetterQueueLater(mv, 1+attempt, callback)
+		return
 	}
 	// Set result if succeed in changing invisible time.
 	callback(nil)
@@ -154,22 +178,22 @@ func (dpq *defaultProcessQueue) forwardToDeadLetterQueueLater(mv *MessageView, a
 			if err := recover(); err != nil {
 				dpq.consumer.cli.log.Errorf("[Bug] Failed to schedule message change invisible duration request, mq=%s, messageId=%s, "+
 					"clientId=%s", dpq.mqstr, messageId, clientId)
-				dpq.ackMessageLater(mv, 1+attempt, callback)
+				dpq.forwardToDeadLetterQueueLater(mv, 1+attempt, callback)
 			}
 		}()
-		dpq.ackMessage0(mv, attempt, callback)
+		dpq.forwardToDeadLetterQueue0(mv, attempt, callback)
 	})
 }
 
 func (dpq *defaultProcessQueue) eraseMessage(mv *MessageView, consumeResult ConsumerResult) {
-	if consumeResult == SUCCESS {
+	consumeResult = dpq.convertSuspendResultIfNeeded(consumeResult)
+	if consumeResult.Type == ConsumerResultTypeSuccess || consumeResult.Type == ConsumerResultTypeSuspend {
 		dpq.consumer.consumptionOkQuantity.Inc()
 		dpq.ackMessage(mv, func(error) { dpq.evictCacheMessage(mv) })
 	} else {
 		dpq.consumer.consumptionErrorQuantity.Inc()
 		dpq.nackMessage(mv, func(error) { dpq.evictCacheMessage(mv) })
 	}
-
 }
 
 func (dpq *defaultProcessQueue) discardMessage(mv *MessageView) {
@@ -214,6 +238,7 @@ func (dpq *defaultProcessQueue) changeInvisibleDuration(mv *MessageView, duratio
 			" clientId=%s, consumerGroup=%s, messageId=%s, attempt=%d, mq=%s, endpoints=%v, requestId=%s, status message=[%s]", clientId, consumerGroup, messageId, attempt, dpq.mqstr,
 			endpoints, requestId, status.GetMessage())
 		dpq.changeInvisibleDurationLater(mv, duration, 1+attempt, callback)
+		return
 	}
 	// Set result if succeed in changing invisible time.
 	callback(nil)
@@ -280,6 +305,7 @@ func (dpq *defaultProcessQueue) ackMessage0(mv *MessageView, attempt int, callba
 			" clientId=%s, consumerGroup=%s, messageId=%s, attempt=%d, mq=%s, endpoints=%v, requestId=%s, status message=[%s]", clientId, consumerGroup, messageId, attempt, dpq.mqstr,
 			endpoints, requestId, status.GetMessage())
 		dpq.ackMessageLater(mv, 1+attempt, callback)
+		return
 	}
 	// Set result if succeed in changing invisible time.
 	callback(nil)
@@ -414,7 +440,7 @@ func (dpq *defaultProcessQueue) receiveMessageImmediatelyWithAttemptId(attemptId
 	endpoints := dpq.mq.Broker.Endpoints
 	batchSize := dpq.getReceptionBatchSize()
 	longPollingTimeout := dpq.consumer.pcSettings.longPollingTimeout
-	request := dpq.consumer.wrapReceiveMessageRequest(int(batchSize), dpq.mq, dpq.filterExpression, longPollingTimeout)
+	request := dpq.consumer.pushConsumerExtension.WrapReceiveMessageRequest(int(batchSize), dpq.mq, dpq.filterExpression, longPollingTimeout)
 
 	startTime := time.Now()
 	dpq.activityNanoTime.Store(startTime.UnixNano())
@@ -438,11 +464,17 @@ func (dpq *defaultProcessQueue) receiveMessageImmediatelyWithAttemptId(attemptId
 			if status.Code(err) == codes.DeadlineExceeded {
 				nextAttemptId = request.GetAttemptId()
 			}
-			dpq.consumer.cli.doAfter(MessageHookPoints_RECEIVE, make([]*MessageCommon, 0), duration, MessageHookPointsStatus_ERROR)
-			dpq.consumer.cli.log.Errorf("Exception raised during message reception, mq=%s, endpoints=%v, attemptId=%d, "+
-				"nextAttemptId=%s, clientId=%s, err=%w", dpq.mqstr, endpoints, request.GetAttemptId(), nextAttemptId,
-				clientId, err)
-
+			rpcErr, isRpcErr := AsErrRpcStatus(err)
+			isNoNewMessage := isRpcErr && rpcErr.GetCode() == int32(v2.Code_MESSAGE_NOT_FOUND)
+			if isNoNewMessage {
+				dpq.consumer.cli.log.Debugf("No new message, mq=%s, endpoints=%v, clientId=%s",
+					dpq.mqstr, endpoints, clientId)
+			} else {
+				dpq.consumer.cli.doAfter(MessageHookPoints_RECEIVE, make([]*MessageCommon, 0), duration, MessageHookPointsStatus_ERROR)
+				dpq.consumer.cli.log.Errorf("Exception raised during message reception, mq=%s, endpoints=%v, attemptId=%s, "+
+					"nextAttemptId=%s, clientId=%s, err=%v", dpq.mqstr, endpoints, request.GetAttemptId(), nextAttemptId,
+					clientId, err)
+			}
 			dpq.onReceiveMessageException(err, nextAttemptId)
 		}
 	}()
@@ -478,7 +510,7 @@ func (dpq *defaultProcessQueue) receiveMessageLater(duration time.Duration, atte
 			}
 		}()
 		dpq.consumer.cli.log.Infof("Try to receive message later, mq=%s, delay=%v, clientId=%s", dpq.mqstr, duration, dpq.consumer.cli.clientID)
-		dpq.receiveMessageImmediatelyWithAttemptId(attemptId)
+		dpq.receiveMessageWithAttemptId(attemptId)
 	})
 }
 

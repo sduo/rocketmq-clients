@@ -56,6 +56,22 @@ public interface Client {
     boolean isSslEnabled();
 
     /**
+     * Check whether virtual threads are enabled for client task execution.
+     *
+     * @return a boolean value indicating whether virtual threads are enabled or not.
+     */
+    default boolean isVirtualThreadsEnabled() {
+        return false;
+    }
+
+    /**
+     * Reconnect telemetry to the specified endpoints.
+     *
+     * @param endpoints endpoints to reconnect.
+     */
+    void reconnectTelemetry(Endpoints endpoints);
+
+    /**
      * Send Heartbeat
      *
      * <p> Send a heartbeat to the remote endpoint.

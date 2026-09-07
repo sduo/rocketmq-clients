@@ -9,10 +9,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [ ubuntu-22.04, macos-latest, windows-2022 ]
-        jdk: [11, 17]
+        jdk: ["11", "17", "21"]
     steps:
       - name: Checkout
         uses: actions/checkout@v3
+        with:
+          submodules: recursive
       - name: Set up JDK ${{ matrix.jdk }}
         uses: actions/setup-java@v3
         with:
@@ -20,19 +22,26 @@ jobs:
           distribution: "adopt"
           cache: maven
       - name: Build with Maven
+        if: matrix.jdk != '21'
         working-directory: ./java
         run: mvn -B package --file pom.xml
+      - name: Test virtual threads with JDK 21
+        if: matrix.jdk == '21'
+        working-directory: ./java
+        run: mvn -B -pl client -am '-Dspotbugs.skip=true' '-Dtest=ClientConfigurationTest,ExecutorServicesTest' '-DfailIfNoTests=false' '-Dsurefire.failIfNoSpecifiedTests=false' test
 
   opentelemetry-instrumentation-compatibility:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Current Repository
         uses: actions/checkout@v3
-      # Use JDK 17.
-      - name: Use JDK 17
+        with:
+          submodules: recursive
+      # Use JDK 21.
+      - name: Use JDK 21
         uses: actions/setup-java@v3
         with:
-          java-version: 17
+          java-version: 21
           distribution: "adopt"
       # Build the code of the current repository, skipping tests and code style checks.
       - name: Build Current Repository
@@ -64,15 +73,15 @@ jobs:
       # Replace the RocketMQ client version.
       - name: Replace RocketMQ Client Version
         run: |
-          sed -i 's/org\.apache\.rocketmq:rocketmq-client-java:[^"]*/org.apache.rocketmq:rocketmq-client-java:${{ steps.get_version.outputs.version }}/' instrumentation/rocketmq/rocketmq-client/rocketmq-client-5.0/testing/build.gradle.kts
+          sed -i 's/org\.apache\.rocketmq:rocketmq-client-java:[^"]*/org.apache.rocketmq:rocketmq-client-java:${{ steps.get_version.outputs.version }}/' instrumentation/rocketmq/rocketmq-client-5.0/testing/build.gradle.kts
       # Use JDK 17.
-      - name: Use JDK 17
+      - name: Use JDK 21
         uses: actions/setup-java@v3
         with:
-          java-version: 17
+          java-version: 21
           distribution: "adopt"
           cache: gradle
       # Build the rocketmq opentelemetry test.
       - name: Build OpenTelemetry Instrumentation Test
         run: |
-          ./gradlew :instrumentation:rocketmq:rocketmq-client:rocketmq-client-5.0:javaagent:test -i
+          ./gradlew :instrumentation:rocketmq:rocketmq-client-5.0:javaagent:test -i

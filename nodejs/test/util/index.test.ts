@@ -17,6 +17,7 @@
 
 import { strict as assert } from 'node:assert';
 import {
+  createDuration,
   getTimestamp,
   calculateStringSipHash24,
 } from '../../src/util';
@@ -27,6 +28,23 @@ describe('test/util/index.test.ts', () => {
       const timestamp = getTimestamp();
       assert(timestamp.seconds);
       assert(timestamp.nanos);
+    });
+  });
+
+  describe('createDuration()', () => {
+    it('should split whole seconds correctly', () => {
+      const duration = createDuration(2000);
+      assert.equal(duration.getSeconds(), 2);
+      assert.equal(duration.getNanos(), 0);
+      assert(duration.serializeBinary().length > 0);
+    });
+
+    it('should split non-whole-second milliseconds correctly', () => {
+      const duration = createDuration(2173);
+      assert.equal(duration.getSeconds(), 2);
+      assert.equal(duration.getNanos(), 173000000);
+      // protobuf Duration.seconds is int64, serialization must not throw
+      assert(duration.serializeBinary().length > 0);
     });
   });
 

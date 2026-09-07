@@ -59,6 +59,7 @@ type defaultSimpleConsumer struct {
 	subscriptionExpressionsLock  sync.RWMutex
 	subscriptionExpressions      *map[string]*FilterExpression
 	subTopicRouteDataResultCache sync.Map
+	receiveRateLimiter           *receiveRateLimiter
 }
 
 func (sc *defaultSimpleConsumer) SetRequestTimeout(timeout time.Duration) {
@@ -68,6 +69,18 @@ func (sc *defaultSimpleConsumer) SetRequestTimeout(timeout time.Duration) {
 
 func (sc *defaultSimpleConsumer) isOn() bool {
 	return sc.cli.on.Load()
+}
+
+func (sc *defaultSimpleConsumer) isRunning() bool {
+	return sc.cli.isRunning()
+}
+
+func (sc *defaultSimpleConsumer) getClient() *defaultClient {
+	return sc.cli
+}
+
+func (sc *defaultSimpleConsumer) getRequestTimeout() time.Duration {
+	return sc.scSettings.requestTimeout
 }
 
 func (sc *defaultSimpleConsumer) changeInvisibleDuration0(messageView *MessageView, invisibleDuration time.Duration) (*v2.ChangeInvisibleDurationResponse, error) {
@@ -92,6 +105,14 @@ func (sc *defaultSimpleConsumer) changeInvisibleDuration0(messageView *MessageVi
 		InvisibleDuration: durationpb.New(invisibleDuration),
 		MessageId:         messageView.GetMessageId(),
 	}
+
+	// Set LiteTopic only for lite consumer
+	if messageView.GetLiteTopic() != "" && sc.scSettings.GetClientType() == v2.ClientType_LITE_SIMPLE_CONSUMER {
+		request.LiteTopic = &messageView.liteTopic
+		suspend := true
+		request.Suspend = &suspend
+	}
+
 	watchTime := time.Now()
 	resp, err := sc.cli.clientManager.ChangeInvisibleDuration(ctx, endpoints, request, sc.scSettings.requestTimeout)
 	duration := time.Since(watchTime)
@@ -189,18 +210,23 @@ func (sc *defaultSimpleConsumer) wrapReceiveMessageRequest(batchSize int, messag
 }
 
 func (sc *defaultSimpleConsumer) wrapAckMessageRequest(messageView *MessageView) *v2.AckMessageRequest {
+	entry := &v2.AckMessageEntry{
+		MessageId:     messageView.GetMessageId(),
+		ReceiptHandle: messageView.GetReceiptHandle(),
+	}
+
+	// Set LiteTopic only for lite consumer
+	if messageView.GetLiteTopic() != "" && sc.scSettings.GetClientType() == v2.ClientType_LITE_SIMPLE_CONSUMER {
+		entry.LiteTopic = &messageView.liteTopic
+	}
+
 	return &v2.AckMessageRequest{
 		Group: sc.scSettings.groupName,
 		Topic: &v2.Resource{
 			Name:              messageView.GetTopic(),
 			ResourceNamespace: sc.cli.config.NameSpace,
 		},
-		Entries: []*v2.AckMessageEntry{
-			{
-				MessageId:     messageView.GetMessageId(),
-				ReceiptHandle: messageView.GetReceiptHandle(),
-			},
-		},
+		Entries: []*v2.AckMessageEntry{entry},
 	}
 }
 
@@ -209,7 +235,6 @@ func (sc *defaultSimpleConsumer) GetGroupName() string {
 }
 
 func (sc *defaultSimpleConsumer) receiveMessage(ctx context.Context, request *v2.ReceiveMessageRequest, messageQueue *v2.MessageQueue, timeout time.Duration) ([]*MessageView, error) {
-	var err error
 	ctx = sc.cli.Sign(ctx)
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -218,36 +243,38 @@ func (sc *defaultSimpleConsumer) receiveMessage(ctx context.Context, request *v2
 	if err != nil {
 		return nil, err
 	}
-	done := make(chan bool, 1)
+	type receiveResult struct {
+		responses []*v2.ReceiveMessageResponse
+		err       error
+	}
+	done := make(chan receiveResult, 1)
 
-	resps := make([]*v2.ReceiveMessageResponse, 0)
 	go func() {
+		var resps []*v2.ReceiveMessageResponse
+		var recvErr error
 		for {
 			var resp *v2.ReceiveMessageResponse
-			resp, err = receiveMessageClient.Recv()
-			if err == io.EOF {
-				done <- true
-				defer close(done)
+			resp, recvErr = receiveMessageClient.Recv()
+			if recvErr == io.EOF {
+				done <- receiveResult{responses: resps}
 				break
 			}
-			if err != nil {
-				sc.cli.log.Errorf("simpleConsumer recv msg err=%v, requestId=%s", err, utils.GetRequestID(ctx))
-				done <- true
-				defer close(done)
+			if recvErr != nil {
+				sc.cli.log.Errorf("simpleConsumer recv msg err=%v, requestId=%s", recvErr, utils.GetRequestID(ctx))
+				done <- receiveResult{err: recvErr}
 				break
 			}
 			sugarBaseLogger.Debugf("receiveMessage response: %v", resp)
 			resps = append(resps, resp)
 		}
-		cancel()
 	}()
 	select {
 	case <-ctx.Done():
 		// timeout
 		return nil, fmt.Errorf("[error] CODE=DEADLINE_EXCEEDED")
-	case <-done:
-		if err != nil && err != io.EOF {
-			return nil, err
+	case result := <-done:
+		if result.err != nil {
+			return nil, result.err
 		}
 		messageViewList := make([]*MessageView, 0)
 		status := &v2.Status{
@@ -256,7 +283,7 @@ func (sc *defaultSimpleConsumer) receiveMessage(ctx context.Context, request *v2
 		}
 		var deliveryTimestamp *timestamppb.Timestamp
 		messageList := make([]*v2.Message, 0)
-		for _, resp := range resps {
+		for _, resp := range result.responses {
 			switch r := resp.GetContent().(type) {
 			case *v2.ReceiveMessageResponse_Status:
 				status = r.Status
@@ -318,6 +345,13 @@ func (sc *defaultSimpleConsumer) Receive(ctx context.Context, maxMessageNum int3
 	if err != nil {
 		return nil, err
 	}
+
+	// Apply rate limiting
+	if err = sc.receiveRateLimiter.acquire(ctx); err != nil {
+		return nil, fmt.Errorf("failed to acquire rate limit permit: %w", err)
+	}
+	defer sc.receiveRateLimiter.release()
+
 	request := sc.wrapReceiveMessageRequest(int(maxMessageNum), selectMessageQueue, filterExpression, invisibleDuration)
 	timeout := sc.scOpts.awaitDuration + sc.cli.opts.timeout
 	return sc.receiveMessage(ctx, request, selectMessageQueue, timeout)
@@ -338,11 +372,15 @@ func (sc *defaultSimpleConsumer) onVerifyMessageCommand(endpoints *v2.Endpoints,
 func (sc *defaultSimpleConsumer) wrapHeartbeatRequest() *v2.HeartbeatRequest {
 	return &v2.HeartbeatRequest{
 		Group:      sc.scSettings.groupName,
-		ClientType: v2.ClientType_SIMPLE_CONSUMER,
+		ClientType: sc.scSettings.clientType,
 	}
 }
 
 var NewSimpleConsumer = func(config *Config, opts ...SimpleConsumerOption) (SimpleConsumer, error) {
+	return newSimpleConsumer(config, opts...)
+}
+
+var newSimpleConsumer = func(config *Config, opts ...SimpleConsumerOption) (*defaultSimpleConsumer, error) {
 	copyOpt := defaultSimpleConsumerOptions
 	scOpts := &copyOpt
 	for _, opt := range opts {
@@ -365,6 +403,7 @@ var NewSimpleConsumer = func(config *Config, opts ...SimpleConsumerOption) (Simp
 
 		awaitDuration:           scOpts.awaitDuration,
 		subscriptionExpressions: &scOpts.subscriptionExpressions,
+		receiveRateLimiter:      newReceiveRateLimiter(scOpts.maxReceiveConcurrency),
 	}
 
 	sc.cli.initTopics = make([]string, 0)
@@ -420,12 +459,27 @@ func (sc *defaultSimpleConsumer) getSubscriptionTopicRouteResult(ctx context.Con
 	if err != nil {
 		return nil, err
 	}
+	route = sc.filterTopicRouteData(route)
 	slb, err := NewSubscriptionLoadBalancer(route)
 	if err != nil {
 		return nil, err
 	}
 	sc.subTopicRouteDataResultCache.Store(topic, slb)
 	return slb, nil
+}
+
+// filterTopicRouteData keeps only the first readable master queue for lite consumers,
+// since lite consumers only need routes to brokers.
+func (sc *defaultSimpleConsumer) filterTopicRouteData(messageQueues []*v2.MessageQueue) []*v2.MessageQueue {
+	if sc.scSettings.GetClientType() != v2.ClientType_LITE_SIMPLE_CONSUMER {
+		return messageQueues
+	}
+	for _, mq := range messageQueues {
+		if isReadableMasterQueue(mq) {
+			return []*v2.MessageQueue{mq}
+		}
+	}
+	return []*v2.MessageQueue{}
 }
 
 // Ack implements SimpleConsumer
@@ -440,14 +494,15 @@ func (sc *defaultSimpleConsumer) Ack(ctx context.Context, messageView *MessageVi
 	request := sc.wrapAckMessageRequest(messageView)
 	ctx = sc.cli.Sign(ctx)
 	resp, err := sc.cli.clientManager.AckMessage(ctx, endpoints, request, sc.cli.opts.timeout)
-	messageHookPointsStatus := MessageHookPointsStatus_ERROR
+	messageHookPointsStatus := MessageHookPointsStatus_OK
 	duration := time.Since(watchTime)
 	if err != nil {
+		messageHookPointsStatus = MessageHookPointsStatus_ERROR
 		sc.cli.doAfter(MessageHookPoints_ACK, messageCommons, duration, messageHookPointsStatus)
 		return err
 	}
 	if resp.GetStatus().GetCode() != v2.Code_OK {
-		messageHookPointsStatus = MessageHookPointsStatus_OK
+		messageHookPointsStatus = MessageHookPointsStatus_ERROR
 	}
 	sc.cli.doAfter(MessageHookPoints_ACK, messageCommons, duration, messageHookPointsStatus)
 	return nil

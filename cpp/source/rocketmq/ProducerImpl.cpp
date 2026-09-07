@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "ProducerImpl.h"
+#include "FmtEnumFormatter.h"
 
 #include <algorithm>
 #include <cassert>
@@ -54,9 +55,9 @@ ProducerImpl::~ProducerImpl() {
 void ProducerImpl::start() {
   ClientImpl::start();
 
-  State expecting = State::STARTING;
-  if (!state_.compare_exchange_strong(expecting, State::STARTED)) {
-    SPDLOG_ERROR("Producer started with an unexpected state. Expecting: {}, Actual: {}", State::STARTING,
+  State expected = State::CREATED;
+  if (!state_.compare_exchange_strong(expected, State::STARTED)) {
+    SPDLOG_ERROR("Producer started with unexpected state. Expecting: {}, Actual: {}", State::CREATED,
                  state_.load(std::memory_order_relaxed));
     return;
   }
@@ -64,19 +65,19 @@ void ProducerImpl::start() {
   client_manager_->addClientObserver(shared_from_this());
 }
 
-void ProducerImpl::shutdown() {
+void ProducerImpl::shutdown() noexcept {
   State expected = State::STARTED;
-  if (!state_.compare_exchange_strong(expected, State::STOPPING)) {
-    SPDLOG_ERROR("Shutdown with unexpected state. Expecting: {}, Actual: {}", State::STOPPING,
-                 state_.load(std::memory_order_relaxed));
+  if (!state_.compare_exchange_strong(expected, State::STOPPED)) {
     return;
   }
 
-  notifyClientTermination();
+  {
+    absl::MutexLock lock(&topic_publish_info_mtx_);
+    topic_publish_info_table_.clear();
+  }
 
   ClientImpl::shutdown();
-  assert(State::STOPPED == state_.load());
-  SPDLOG_INFO("Producer instance stopped");
+  SPDLOG_INFO("ProducerImpl stopped");
 }
 
 void ProducerImpl::notifyClientTermination() {
@@ -137,14 +138,11 @@ void ProducerImpl::wrapSendMessageRequest(const Message& message, SendMessageReq
 
   // Delivery Timestamp
   if (message.deliveryTimestamp().time_since_epoch().count()) {
-    auto delivery_timestamp = message.deliveryTimestamp();
-    if (delivery_timestamp.time_since_epoch().count()) {
-      auto duration = delivery_timestamp.time_since_epoch();
-      system_properties->set_delivery_attempt(std::chrono::duration_cast<std::chrono::milliseconds>(duration).count());
-      auto mutable_delivery_timestamp = system_properties->mutable_delivery_timestamp();
-      mutable_delivery_timestamp->set_seconds(std::chrono::duration_cast<std::chrono::seconds>(duration).count());
-      mutable_delivery_timestamp->set_nanos(std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count() % 1000000000);
-    }
+    auto duration = message.deliveryTimestamp().time_since_epoch();
+    system_properties->set_delivery_attempt(std::chrono::duration_cast<std::chrono::milliseconds>(duration).count());
+    auto mutable_delivery_timestamp = system_properties->mutable_delivery_timestamp();
+    mutable_delivery_timestamp->set_seconds(std::chrono::duration_cast<std::chrono::seconds>(duration).count());
+    mutable_delivery_timestamp->set_nanos(std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count() % 1000000000);
   }
 
   // Born-time
@@ -155,10 +153,14 @@ void ProducerImpl::wrapSendMessageRequest(const Message& message, SendMessageReq
 
   system_properties->set_born_host(UtilAll::hostname());
 
+  // Determine message type based on properties
   if (message.deliveryTimestamp().time_since_epoch().count()) {
     system_properties->set_message_type(rmq::MessageType::DELAY);
   } else if (!message.group().empty()) {
     system_properties->set_message_type(rmq::MessageType::FIFO);
+  } else if (message.priority() >= 0) {
+    system_properties->set_message_type(rmq::MessageType::PRIORITY);
+    system_properties->set_priority(message.priority());
   } else if (message.extension().transactional) {
     system_properties->set_message_type(rmq::MessageType::TRANSACTION);
   } else {
@@ -225,17 +227,17 @@ SendReceipt ProducerImpl::send(MessageConstPtr message, std::error_code& ec) noe
   auto cv = std::make_shared<absl::CondVar>();
   bool          completed = false;
   SendReceipt   send_receipt;
+  const std::string topic = message->topic();
 
   // Define callback
   auto callback =
-      [&, mtx, cv](const std::error_code& code, const SendReceipt& receipt) mutable {
+      [&, mtx, cv](const std::error_code& code, SendReceipt&& receipt) mutable {
     ec = code;
-    auto& receipt_mut = const_cast<SendReceipt&>(receipt);
-    send_receipt.target = std::move(receipt_mut.target);
-    send_receipt.message_id = std::move(receipt_mut.message_id);
-    send_receipt.message = std::move(receipt_mut.message);
-    send_receipt.transaction_id = std::move(receipt_mut.transaction_id);
-    send_receipt.recall_handle = std::move(receipt_mut.recall_handle);
+    send_receipt.target = std::move(receipt.target);
+    send_receipt.message_id = std::move(receipt.message_id);
+    send_receipt.message = std::move(receipt.message);
+    send_receipt.transaction_id = std::move(receipt.transaction_id);
+    send_receipt.recall_handle = std::move(receipt.recall_handle);
     {
       absl::MutexLock lk(mtx.get());
       completed = true;
@@ -247,8 +249,15 @@ SendReceipt ProducerImpl::send(MessageConstPtr message, std::error_code& ec) noe
 
   {
     absl::MutexLock lk(mtx.get());
-    if (!completed) {
-      cv->Wait(mtx.get());
+    // Bound the synchronous wait. The callback may never run if the underlying
+    // RPC stalls, so an unbounded Wait() would hang the calling thread forever.
+    auto deadline = absl::Now() + requestTimeout();
+    while (!completed) {
+      if (cv->WaitWithDeadline(mtx.get(), deadline)) {
+        SPDLOG_WARN("Timeout waiting for send result of topic[{}]", topic);
+        ec = ErrorCode::RequestTimeout;
+        break;
+      }
     }
   }
 
@@ -261,7 +270,8 @@ void ProducerImpl::send(MessageConstPtr message, SendCallback cb) {
   if (ec) {
     SendReceipt send_receipt;
     send_receipt.message = std::move(message);
-    cb(ec, send_receipt);
+    cb(ec, std::move(send_receipt));
+    return;
   }
 
   std::string topic = message->topic();
@@ -275,7 +285,7 @@ void ProducerImpl::send(MessageConstPtr message, SendCallback cb) {
     if (ec) {
       SendReceipt send_receipt;
       send_receipt.message = std::move(ptr);
-      cb(ec, send_receipt);
+      cb(ec, std::move(send_receipt));
       return;
     }
 
@@ -283,7 +293,7 @@ void ProducerImpl::send(MessageConstPtr message, SendCallback cb) {
       std::error_code ec = ErrorCode::NotFound;
       SendReceipt     send_receipt;
       send_receipt.message = std::move(ptr);
-      cb(ec, send_receipt);
+      cb(ec, std::move(send_receipt));
       return;
     }
 
@@ -293,7 +303,7 @@ void ProducerImpl::send(MessageConstPtr message, SendCallback cb) {
       std::error_code ec = ErrorCode::NotFound;
       SendReceipt     send_receipt;
       send_receipt.message = std::move(ptr);
-      cb(ec, send_receipt);
+      cb(ec, std::move(send_receipt));
       return;
     }
 
@@ -359,7 +369,7 @@ void ProducerImpl::sendImpl(std::shared_ptr<SendContext> context) {
     context->onSuccess(send_result);
   };
 
-  client_manager_->send(target, metadata, request, callback);
+  client_manager_->send(target, metadata, request, absl::ToChronoMilliseconds(requestTimeout()), callback);
 }
 
 void ProducerImpl::send0(MessageConstPtr message, const SendCallback& callback, std::vector<rmq::MessageQueue> list) {
@@ -368,14 +378,14 @@ void ProducerImpl::send0(MessageConstPtr message, const SendCallback& callback, 
   validate(*message, ec);
   if (ec) {
     send_receipt.message = std::move(message);
-    callback(ec, send_receipt);
+    callback(ec, std::move(send_receipt));
     return;
   }
 
   if (list.empty()) {
     ec = ErrorCode::NotFound;
     send_receipt.message = std::move(message);
-    callback(ec, send_receipt);
+    callback(ec, std::move(send_receipt));
     return;
   }
 
@@ -460,7 +470,17 @@ bool ProducerImpl::endTransaction0(const MiniTransaction& transaction, Transacti
 
   {
     absl::MutexLock lk(mtx.get());
-    cv->Wait(mtx.get());
+    // Guard on `completed`: the callback may already have run (and signalled with
+    // no waiter present) before we get here, in which case an unguarded Wait()
+    // would block forever. The deadline bounds a stalled RPC.
+    auto deadline = absl::Now() + requestTimeout();
+    while (!completed) {
+      if (cv->WaitWithDeadline(mtx.get(), deadline)) {
+        SPDLOG_WARN("Timeout waiting for {} transaction result of topic[{}]", action, topic);
+        success = false;
+        break;
+      }
+    }
   }
   return success;
 }
@@ -557,6 +577,7 @@ RecallReceipt ProducerImpl::recall(const std::string& topic, std::string& recall
   auto cv = std::make_shared<absl::CondVar>();
 
   RecallReceipt recall_receipt;
+  bool completed = false;
   auto callback =
       [&, mtx, cv, topic](const std::error_code& code, const RecallMessageResponse& response) {
 
@@ -567,6 +588,7 @@ RecallReceipt ProducerImpl::recall(const std::string& topic, std::string& recall
 
     {
       absl::MutexLock lk(mtx.get());
+      completed = true;
       cv->SignalAll();
     }
   };
@@ -576,7 +598,16 @@ RecallReceipt ProducerImpl::recall(const std::string& topic, std::string& recall
 
   {
     absl::MutexLock lk(mtx.get());
-    cv->Wait(mtx.get());
+    // Guard on `completed` so an already-completed callback cannot strand this
+    // thread in an unbounded Wait(), and bound the wait with a deadline.
+    auto deadline = absl::Now() + requestTimeout();
+    while (!completed) {
+      if (cv->WaitWithDeadline(mtx.get(), deadline)) {
+        SPDLOG_WARN("Timeout waiting for recall result of topic[{}]", topic);
+        ec = ErrorCode::RequestTimeout;
+        break;
+      }
+    }
   }
 
   return recall_receipt;
@@ -635,10 +666,20 @@ TopicPublishInfoPtr ProducerImpl::getPublishInfo(const std::string& topic) {
   };
   getPublishInfoAsync(topic, cb);
 
-  // Wait till acquiring topic publish info completes
-  while (!complete) {
+  // Wait till acquiring topic publish info completes.
+  // `complete` must only be read while holding mtx: testing it outside the lock
+  // races with the callback and can miss the signal entirely (the callback may
+  // complete between the check and Wait()), which used to hang this thread
+  // forever. The deadline additionally bounds a stalled route query.
+  {
     absl::MutexLock lk(mtx.get());
-    cv->Wait(mtx.get());
+    auto deadline = absl::Now() + requestTimeout();
+    while (!complete) {
+      if (cv->WaitWithDeadline(mtx.get(), deadline)) {
+        SPDLOG_WARN("Timeout acquiring publish info of topic[{}]", topic);
+        return nullptr;
+      }
+    }
   }
 
   // TODO: propagate error_code to caller
@@ -675,11 +716,11 @@ void ProducerImpl::topicsOfInterest(std::vector<std::string> &topics) {
   }
 }
 
-void ProducerImpl::withTopics(const std::vector<std::string> &topics) {
+void ProducerImpl::withTopics(std::vector<std::string> topics) {
   absl::MutexLock lk(&topics_mtx_);
-  for (auto &topic: topics) {
+  for (auto& topic : topics) {
     if (std::find(topics_.begin(), topics_.end(), topic) == topics_.end()) {
-      topics_.push_back(topic);
+      topics_.push_back(std::move(topic));
     }
   }
 }

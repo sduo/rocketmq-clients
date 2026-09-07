@@ -34,18 +34,21 @@ if __name__ == '__main__':
             msg.topic = topic
             msg.body = "hello, rocketmq.".encode('utf-8')
             # secondary classifier of message besides topic
-            msg.tag = "rocketmq-send-message"
+            msg.tag = "tag"
             # key(s) of the message, another way to mark message besides message id
-            msg.keys = "send_sync"
+            msg.keys = "keys"
             # user property for the message
-            msg.add_property("send", "sync")
-            res = producer.send(msg)
-            print(f"{producer.__str__()} send message success. {res}")
+            msg.add_property("key", "value")
+            for i in range(0, 10):
+                res = producer.send(msg)
+                print(f"{producer} send message success. {res}")
             producer.shutdown()
-            print(f"{producer.__str__()} shutdown.")
+            print(f"{producer} shutdown.")
         except Exception as e:
-            print(f"normal producer example raise exception: {e}")
+            print(f"{producer} raise exception: {e}")
             producer.shutdown()
+            print(f"{producer} shutdown.")
     except Exception as e:
-        print(f"{producer.__str__()} startup raise exception: {e}")
+        print(f"{producer} startup raise exception: {e}")
         producer.shutdown()
+        print(f"{producer} shutdown.")

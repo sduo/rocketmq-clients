@@ -45,9 +45,12 @@ export function sign(accessSecret: string, dateTime: string) {
 }
 
 export function createDuration(ms: number) {
-  const nanos = ms % 1000 * 1000000;
+  // Duration.seconds is a protobuf int64 field, so it must be an integer;
+  // the remainder is carried by nanos. Non-integer seconds would fail
+  // serialization with 'Assertion failed'.
+  const nanos = Math.floor(ms % 1000 * 1000000);
   return new Duration()
-    .setSeconds(ms / 1000)
+    .setSeconds(Math.floor(ms / 1000))
     .setNanos(nanos);
 }
 
@@ -80,4 +83,23 @@ const SIP_HASH_24_KEY = Buffer.from([
 export function calculateStringSipHash24(value: string) {
   const hash = siphash24(Buffer.from(value), SIP_HASH_24_KEY);
   return Buffer.from(hash).readBigUInt64BE();
+}
+
+/**
+ * Calculate hash code for a string (Java String.hashCode() compatible).
+ * This is used for implementing equals/hashCode contract in TypeScript classes.
+ *
+ * @param str - The string to calculate hash code for
+ * @return Hash code as a 32-bit integer
+ */
+export function hashCodeOfString(str: string): number {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    // eslint-disable-next-line no-bitwise
+    hash = ((hash << 5) - hash) + char;
+    // eslint-disable-next-line no-bitwise
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  return hash;
 }

@@ -94,7 +94,7 @@ import org.apache.rocketmq.client.java.rpc.Signature;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-@SuppressWarnings({"UnstableApiUsage", "NullableProblems"})
+@SuppressWarnings({"NullableProblems"})
 public abstract class ClientImpl extends AbstractIdleService implements Client, ClientSessionHandler,
     MessageInterceptor {
     private static final Logger log = LoggerFactory.getLogger(ClientImpl.class);
@@ -114,7 +114,7 @@ public abstract class ClientImpl extends AbstractIdleService implements Client, 
     /**
      * Telemetry command executor, which aims to execute commands from the remote.
      */
-    protected final ThreadPoolExecutor telemetryCommandExecutor;
+    protected final ExecutorService telemetryCommandExecutor;
     protected final ClientId clientId;
 
     private final ClientManager clientManager;
@@ -130,7 +130,6 @@ public abstract class ClientImpl extends AbstractIdleService implements Client, 
     private final ReadWriteLock sessionsLock;
 
     private final CompositedMessageInterceptor compositedMessageInterceptor;
-    private boolean receiveReconnect = false;
 
     public ClientImpl(ClientConfiguration clientConfiguration, Set<String> topics) {
         this.clientConfiguration = checkNotNull(clientConfiguration, "clientConfiguration should not be null");
@@ -152,13 +151,14 @@ public abstract class ClientImpl extends AbstractIdleService implements Client, 
         this.clientManager = new ClientManagerImpl(this);
 
         final long clientIdIndex = clientId.getIndex();
-        this.clientCallbackExecutor = new ThreadPoolExecutor(
-            Runtime.getRuntime().availableProcessors(),
-            Runtime.getRuntime().availableProcessors(),
-            60,
-            TimeUnit.SECONDS,
-            new LinkedBlockingQueue<>(),
-            new ThreadFactoryImpl("ClientCallbackWorker", clientIdIndex));
+        this.clientCallbackExecutor = ExecutorServices.newExecutorService(
+            clientConfiguration.isVirtualThreadsEnabled(), () -> new ThreadPoolExecutor(
+                Runtime.getRuntime().availableProcessors(),
+                Runtime.getRuntime().availableProcessors(),
+                60,
+                TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(),
+                new ThreadFactoryImpl("ClientCallbackWorker", clientIdIndex)));
 
         this.clientMeterManager = new ClientMeterManager(clientId, clientConfiguration);
 
@@ -166,15 +166,15 @@ public abstract class ClientImpl extends AbstractIdleService implements Client, 
             new CompositedMessageInterceptor(Collections.singletonList(new MessageMeterInterceptor(this,
                 clientMeterManager)));
 
-        this.telemetryCommandExecutor = new ThreadPoolExecutor(
-            1,
-            1,
-            60,
-            TimeUnit.SECONDS,
-            new LinkedBlockingQueue<>(),
-            new ThreadFactoryImpl("CommandExecutor", clientIdIndex));
+        this.telemetryCommandExecutor = ExecutorServices.newExecutorService(
+            clientConfiguration.isVirtualThreadsEnabled(), () -> new ThreadPoolExecutor(
+                1,
+                1,
+                60,
+                TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(),
+                new ThreadFactoryImpl("CommandExecutor", clientIdIndex)));
     }
-
 
     /**
      * Start the rocketmq client and do some preparatory work.
@@ -186,15 +186,26 @@ public abstract class ClientImpl extends AbstractIdleService implements Client, 
         // Fetch topic route from remote.
         log.info("Begin to fetch topic(s) route data from remote during client startup, clientId={}, topics={}",
             clientId, topics);
-        for (String topic : topics) {
-            final ListenableFuture<TopicRouteData> future = fetchTopicRoute(topic);
-            future.get();
+        for (int attempt = 1; attempt <= clientConfiguration.getMaxStartupAttempts(); attempt++) {
+            try {
+                for (String topic : topics) {
+                    final ListenableFuture<TopicRouteData> future = fetchTopicRoute(topic);
+                    future.get();
+                }
+                log.info("Fetch topic route data from remote successfully during startup, clientId={}, topics={}",
+                    clientId, topics);
+                break;
+            } catch (Exception e) {
+                log.error("Fetch topics failed when client start, clientId={}, topics={}, attemptTime={}", clientId,
+                    topics, attempt, e);
+                if (attempt == clientConfiguration.getMaxStartupAttempts()) {
+                    throw new RuntimeException(
+                        String.format("Failed to fetch topics after %d attempts", attempt), e);
+                }
+            }
         }
-        log.info("Fetch topic route data from remote successfully during startup, clientId={}, topics={}",
-            clientId, topics);
         // Update route cache periodically.
-        final ScheduledExecutorService scheduler = clientManager.getScheduler();
-        this.updateRouteCacheFuture = scheduler.scheduleWithFixedDelay(() -> {
+        updateRouteCacheFuture = getScheduler().scheduleWithFixedDelay(() -> {
             try {
                 updateRouteCache();
             } catch (Throwable t) {
@@ -284,7 +295,7 @@ public abstract class ClientImpl extends AbstractIdleService implements Client, 
 
     @Override
     public void onReconnectEndpointsCommand(Endpoints endpoints, ReconnectEndpointsCommand command) {
-        receiveReconnect = true;
+        getClientManager().reconnect(endpoints);
     }
 
     /**
@@ -329,7 +340,7 @@ public abstract class ClientImpl extends AbstractIdleService implements Client, 
      * @param settings  settings received from remote.
      */
     @Override
-    public final void onSettingsCommand(Endpoints endpoints, apache.rocketmq.v2.Settings settings) {
+    public void onSettingsCommand(Endpoints endpoints, apache.rocketmq.v2.Settings settings) {
         final Metric metric = new Metric(settings.getMetric());
         clientMeterManager.reset(metric);
         this.getSettings().sync(settings);
@@ -408,7 +419,7 @@ public abstract class ClientImpl extends AbstractIdleService implements Client, 
      * Triggered when {@link TopicRouteData} is fetched from remote.
      */
     public ListenableFuture<TopicRouteData> onTopicRouteDataFetched(String topic,
-    TopicRouteData topicRouteData) throws ClientException {
+        TopicRouteData topicRouteData) throws ClientException {
         final Set<Endpoints> routeEndpoints = topicRouteData
             .getMessageQueues().stream()
             .map(mq -> mq.getBroker().getEndpoints())
@@ -469,8 +480,9 @@ public abstract class ClientImpl extends AbstractIdleService implements Client, 
 
     /**
      * This method is invoked while request of unsubscribe lite topic is received from remote.
+     *
      * @param endpoints remote endpoints.
-      * @param command  request of unsubscribe lite topic from remote.
+     * @param command   request of unsubscribe lite topic from remote.
      */
     @Override
     public void onNotifyUnsubscribeLiteCommand(Endpoints endpoints, NotifyUnsubscribeLiteCommand command) {
@@ -536,12 +548,21 @@ public abstract class ClientImpl extends AbstractIdleService implements Client, 
         return clientId;
     }
 
-    public boolean isReceiveReconnect() {
-        return receiveReconnect;
-    }
-
-    public void setReceiveReconnect(boolean receiveReconnect) {
-        this.receiveReconnect = receiveReconnect;
+    @Override
+    public void reconnectTelemetry(Endpoints endpoints) {
+        final ClientSessionImpl clientSession;
+        sessionsLock.readLock().lock();
+        try {
+            clientSession = sessionsTable.get(endpoints);
+        } finally {
+            sessionsLock.readLock().unlock();
+        }
+        if (null == clientSession) {
+            log.warn("Failed to rebuild telemetry because client session does not exist, endpoints={}, clientId={}",
+                endpoints, clientId);
+            return;
+        }
+        clientSession.reconnect();
     }
 
     /**
@@ -567,6 +588,11 @@ public abstract class ClientImpl extends AbstractIdleService implements Client, 
     @Override
     public boolean isSslEnabled() {
         return clientConfiguration.isSslEnabled();
+    }
+
+    @Override
+    public boolean isVirtualThreadsEnabled() {
+        return clientConfiguration.isVirtualThreadsEnabled();
     }
 
     /**
@@ -658,7 +684,7 @@ public abstract class ClientImpl extends AbstractIdleService implements Client, 
         }, MoreExecutors.directExecutor());
     }
 
-    protected Set<Endpoints> getTotalRouteEndpoints() {
+    public Set<Endpoints> getTotalRouteEndpoints() {
         Set<Endpoints> totalRouteEndpoints = new HashSet<>();
         for (TopicRouteData topicRouteData : topicRouteCache.values()) {
             totalRouteEndpoints.addAll(topicRouteData.getTotalEndpoints());
@@ -750,7 +776,7 @@ public abstract class ClientImpl extends AbstractIdleService implements Client, 
         return clientManager.getScheduler();
     }
 
-    protected <T> T handleClientFuture(ListenableFuture<T> future) throws ClientException {
+    public <T> T handleClientFuture(ListenableFuture<T> future) throws ClientException {
         try {
             return future.get();
         } catch (InterruptedException e) {
@@ -774,5 +800,14 @@ public abstract class ClientImpl extends AbstractIdleService implements Client, 
     @Override
     protected String serviceName() {
         return super.serviceName() + "-" + clientId.getIndex();
+    }
+
+    public void checkRunning() {
+        if (!isRunning()) {
+            String msg = String.format("Client not running, state=%s, clientId=%s",
+                state(), clientId);
+            log.error(msg);
+            throw new IllegalStateException(msg);
+        }
     }
 }

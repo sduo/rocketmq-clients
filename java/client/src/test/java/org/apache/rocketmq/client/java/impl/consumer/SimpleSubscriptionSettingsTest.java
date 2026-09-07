@@ -27,9 +27,9 @@ import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import org.apache.rocketmq.client.apis.ClientConfiguration;
 import org.apache.rocketmq.client.apis.consumer.FilterExpression;
 import org.apache.rocketmq.client.apis.consumer.FilterExpressionType;
-import org.apache.rocketmq.client.java.message.protocol.Resource;
 import org.apache.rocketmq.client.java.misc.ClientId;
 import org.apache.rocketmq.client.java.tool.TestBase;
 import org.junit.Assert;
@@ -39,17 +39,28 @@ public class SimpleSubscriptionSettingsTest extends TestBase {
 
     @Test
     public void testToProtobuf() {
-        Resource groupResource = new Resource(FAKE_NAMESPACE, FAKE_CONSUMER_GROUP_0);
+        final Duration requestTimeout = Duration.ofSeconds(3);
+        ClientConfiguration clientConfiguration = ClientConfiguration.newBuilder()
+            .setNamespace(FAKE_NAMESPACE)
+            .setRequestTimeout(requestTimeout)
+            .setEndpoints(FAKE_ENDPOINTS)
+            .addClientProperty("key1", "value1")
+            .addClientProperty("key2", "value2")
+            .build();
         ClientId clientId = new ClientId();
         Map<String, FilterExpression> subscriptionExpression = new HashMap<>();
         subscriptionExpression.put(FAKE_TOPIC_0, new FilterExpression());
-        final Duration requestTimeout = Duration.ofSeconds(3);
         final Duration longPollingTimeout = Duration.ofSeconds(15);
-        final SimpleSubscriptionSettings simpleSubscriptionSettings = new SimpleSubscriptionSettings(FAKE_NAMESPACE,
-            clientId, fakeEndpoints(), groupResource, requestTimeout, longPollingTimeout, subscriptionExpression);
+        final SimpleSubscriptionSettings simpleSubscriptionSettings = new SimpleSubscriptionSettings(
+            clientConfiguration, clientId,
+            org.apache.rocketmq.client.java.impl.ClientType.SIMPLE_CONSUMER,
+            fakeEndpoints(), FAKE_CONSUMER_GROUP_0,
+            longPollingTimeout, subscriptionExpression);
         final Settings settings = simpleSubscriptionSettings.toProtobuf();
         Assert.assertEquals(settings.getClientType(), ClientType.SIMPLE_CONSUMER);
         Assert.assertEquals(settings.getRequestTimeout(), Durations.fromNanos(requestTimeout.toNanos()));
+        Assert.assertEquals("value1", settings.getClientPropertiesMap().get("key1"));
+        Assert.assertEquals("value2", settings.getClientPropertiesMap().get("key2"));
         Assert.assertTrue(settings.hasSubscription());
         final Subscription subscription = settings.getSubscription();
         Assert.assertEquals(subscription.getGroup(),
@@ -72,15 +83,22 @@ public class SimpleSubscriptionSettingsTest extends TestBase {
 
     @Test
     public void testToProtobufWithSqlExpression() {
-        Resource groupResource = new Resource(FAKE_NAMESPACE, FAKE_CONSUMER_GROUP_0);
+        final Duration requestTimeout = Duration.ofSeconds(3);
+        ClientConfiguration clientConfiguration = ClientConfiguration.newBuilder()
+            .setNamespace(FAKE_NAMESPACE)
+            .setRequestTimeout(requestTimeout)
+            .setEndpoints(FAKE_ENDPOINTS)
+            .build();
         ClientId clientId = new ClientId();
         Map<String, FilterExpression> subscriptionExpression = new HashMap<>();
         subscriptionExpression.put(FAKE_TOPIC_0, new FilterExpression("(a > 10 AND a < 100) OR (b IS NOT NULL AND "
             + "b=TRUE)", FilterExpressionType.SQL92));
-        final Duration requestTimeout = Duration.ofSeconds(3);
         final Duration longPollingTimeout = Duration.ofSeconds(15);
-        final SimpleSubscriptionSettings simpleSubscriptionSettings = new SimpleSubscriptionSettings(FAKE_NAMESPACE,
-            clientId, fakeEndpoints(), groupResource, requestTimeout, longPollingTimeout, subscriptionExpression);
+        final SimpleSubscriptionSettings simpleSubscriptionSettings = new SimpleSubscriptionSettings(
+            clientConfiguration, clientId,
+            org.apache.rocketmq.client.java.impl.ClientType.SIMPLE_CONSUMER,
+            fakeEndpoints(), FAKE_CONSUMER_GROUP_0,
+            longPollingTimeout, subscriptionExpression);
         final Settings settings = simpleSubscriptionSettings.toProtobuf();
         Assert.assertEquals(settings.getClientType(), ClientType.SIMPLE_CONSUMER);
         Assert.assertEquals(settings.getRequestTimeout(), Durations.fromNanos(requestTimeout.toNanos()));

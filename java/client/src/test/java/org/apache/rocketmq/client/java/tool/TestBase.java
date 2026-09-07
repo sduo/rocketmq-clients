@@ -52,6 +52,7 @@ import io.grpc.Metadata;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -183,7 +184,7 @@ public class TestBase {
         final byte[] body = RandomUtils.nextBytes(bodySize);
         Map<String, String> properties = new HashMap<>();
         List<String> keys = new ArrayList<>();
-        return new MessageViewImpl(messageId, FAKE_TOPIC_0, body, null, null, null, null,
+        return new MessageViewImpl(messageId, FAKE_TOPIC_0, body, null, null, null, null, null,
             keys, properties, FAKE_HOST_0, 1, 1, mq, FAKE_RECEIPT_HANDLE_0, 1, corrupted,
             System.currentTimeMillis());
     }
@@ -393,7 +394,7 @@ public class TestBase {
 
     protected PublishingSettings fakeProducerSettings() {
         return new PublishingSettings(FAKE_NAMESPACE, FAKE_CLIENT_ID, fakeEndpoints(),
-            fakeExponentialBackoffRetryPolicy(), Duration.ofSeconds(1), new HashSet<>());
+            fakeExponentialBackoffRetryPolicy(), Duration.ofSeconds(1), new HashSet<>(), Collections.emptyMap());
     }
 
     protected SendReceiptImpl fakeSendReceiptImpl(

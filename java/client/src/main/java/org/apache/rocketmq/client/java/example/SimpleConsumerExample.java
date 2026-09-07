@@ -55,6 +55,9 @@ public class SimpleConsumerExample {
             // On some Windows platforms, you may encounter SSL compatibility issues. Try turning off the SSL option in
             // client configuration to solve the problem please if SSL is not essential.
             // .enableSsl(false)
+            // Set optional opaque client properties for server-side observability.
+            // .addClientProperty("key1", "value1")
+            // .addClientProperty("key2", "value2")
             .setCredentialProvider(sessionCredentialsProvider)
             .build();
         String consumerGroup = "yourConsumerGroup";
@@ -72,6 +75,8 @@ public class SimpleConsumerExample {
             // Set the subscription for the consumer.
             .setSubscriptionExpressions(Collections.singletonMap(topic, filterExpression))
             .build();
+        // You can calculate the number of messages that need to be received each time
+        // and the invisible time based on the estimated processing time of each message.
         // Max message num for each long polling.
         int maxMessageNum = 16;
         // Set message invisible duration after it is received.

@@ -17,18 +17,38 @@
 #include <chrono>
 #include <memory>
 
+#include <spdlog/spdlog.h>
+
 #include "PushConsumerImpl.h"
 #include "StaticNameServerResolver.h"
 #include "rocketmq/PushConsumer.h"
 
 ROCKETMQ_NAMESPACE_BEGIN
 
-void PushConsumer::subscribe(std::string topic, FilterExpression filter_expression) {
-  impl_->subscribe(std::move(topic), filter_expression.content_, filter_expression.type_);
+void PushConsumer::subscribe(std::string topic, FilterExpression filter_expression) noexcept {
+  try {
+    impl_->subscribe(std::move(topic), filter_expression.content_, filter_expression.type_);
+  } catch (const std::exception& e) {
+    SPDLOG_ERROR("Exception in subscribe: {}", e.what());
+  }
 }
 
-void PushConsumer::unsubscribe(const std::string& topic) {
-  impl_->unsubscribe(topic);
+void PushConsumer::unsubscribe(const std::string& topic) noexcept {
+  try {
+    impl_->unsubscribe(topic);
+  } catch (const std::exception& e) {
+    SPDLOG_ERROR("Exception in unsubscribe: {}", e.what());
+  }
+}
+
+void PushConsumer::shutdown() noexcept {
+  try {
+    if (impl_) {
+      impl_->shutdown();
+    }
+  } catch (const std::exception& e) {
+    SPDLOG_ERROR("Exception in shutdown: {}", e.what());
+  }
 }
 
 PushConsumerBuilder PushConsumer::newBuilder() {
@@ -44,10 +64,11 @@ PushConsumer PushConsumerBuilder::build() {
   impl->consumeThreadPoolSize(consume_thread_);
   impl->withNameServerResolver(std::make_shared<StaticNameServerResolver>(configuration_.endpoints()));
   impl->withResourceNamespace(configuration_.resourceNamespace());
-  impl->withSsl(configuration_.withSsl());
   impl->withCredentialsProvider(configuration_.credentialsProvider());
   impl->withRequestTimeout(configuration_.requestTimeout());
   impl->withFifoConsumeAccelerator(fifo_consume_accelerator_);
+  impl->withCallbackThreads(configuration_.callbackThreads());
+  impl->withSsl(configuration_.withSsl());
   impl->start();
   return PushConsumer(impl);
 }

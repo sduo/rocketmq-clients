@@ -32,7 +32,6 @@ import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.MoreExecutors;
 import com.google.common.util.concurrent.SettableFuture;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
-import io.grpc.StatusRuntimeException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -47,7 +46,9 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.apache.rocketmq.client.apis.consumer.ConsumeResult;
+import org.apache.rocketmq.client.apis.consumer.ConsumeResultSuspend;
 import org.apache.rocketmq.client.apis.consumer.FilterExpression;
+import org.apache.rocketmq.client.apis.consumer.LitePushConsumer;
 import org.apache.rocketmq.client.apis.message.MessageId;
 import org.apache.rocketmq.client.apis.message.MessageView;
 import org.apache.rocketmq.client.java.exception.BadRequestException;
@@ -74,7 +75,7 @@ import org.slf4j.LoggerFactory;
  *
  * @see ProcessQueue
  */
-@SuppressWarnings({"NullableProblems", "UnstableApiUsage"})
+@SuppressWarnings({"NullableProblems"})
 class ProcessQueueImpl implements ProcessQueue {
     static final Duration FORWARD_FIFO_MESSAGE_TO_DLQ_FAILURE_BACKOFF_DELAY = Duration.ofSeconds(1);
     static final Duration ACK_MESSAGE_FAILURE_BACKOFF_DELAY = Duration.ofSeconds(1);
@@ -249,6 +250,9 @@ class ProcessQueueImpl implements ProcessQueue {
             Futures.addCallback(future, new FutureCallback<ReceiveMessageResult>() {
                     @Override
                     public void onSuccess(ReceiveMessageResult result) {
+                        // Rotate the attempt ID based on the raw response because messages removed by an interceptor
+                        // were still delivered by the server for this attempt.
+                        final boolean hasReceivedMessages = !result.getMessageViewImpls().isEmpty();
                         // Intercept after message reception.
                         final List<GeneralMessage> generalMessages = result.getMessageViewImpls().stream()
                             .map((Function<MessageView, GeneralMessage>) GeneralMessageImpl::new)
@@ -296,35 +300,29 @@ class ProcessQueueImpl implements ProcessQueue {
                                 // Create new ReceiveMessageResult with filtered messages.
                                 ReceiveMessageResult filteredResult =
                                     ReceiveMessageResult.createFilteredResult(result, remainingMessages);
-                                onReceiveMessageResult(filteredResult);
+                                onReceiveMessageResult(filteredResult, request.getAttemptId(), hasReceivedMessages);
                             } catch (Throwable t) {
                                 // Should never reach here.
                                 log.error("[Bug] Exception raised while handling receive result, mq={}, endpoints={}, "
                                     + "clientId={}", mq, endpoints, clientId, t);
-                                onReceiveMessageException(t, attemptId);
+                                onReceiveMessageException(t, request.getAttemptId());
                             }
                         } else {
                             // When filtering is disabled, use original result directly to avoid performance overhead.
                             try {
-                                onReceiveMessageResult(result);
+                                onReceiveMessageResult(result, request.getAttemptId(), hasReceivedMessages);
                             } catch (Throwable t) {
                                 // Should never reach here.
                                 log.error("[Bug] Exception raised while handling receive result, mq={}, endpoints={}, "
                                     + "clientId={}", mq, endpoints, clientId, t);
-                                onReceiveMessageException(t, attemptId);
+                                onReceiveMessageException(t, request.getAttemptId());
                             }
                         }
                     }
 
                     @Override
                     public void onFailure(Throwable t) {
-                        String nextAttemptId = null;
-                        if (t instanceof StatusRuntimeException) {
-                            StatusRuntimeException exception = (StatusRuntimeException) t;
-                            if (io.grpc.Status.DEADLINE_EXCEEDED.getCode() == exception.getStatus().getCode()) {
-                                nextAttemptId = request.getAttemptId();
-                            }
-                        }
+                        final String nextAttemptId = request.getAttemptId();
                         // Intercept after message reception.
                         final MessageInterceptorContextImpl context0 =
                             new MessageInterceptorContextImpl(context, MessageHookPointsStatus.ERROR);
@@ -395,7 +393,7 @@ class ProcessQueueImpl implements ProcessQueue {
         return cachedMessagesBytes.get();
     }
 
-    private void onReceiveMessageResult(ReceiveMessageResult result) {
+    private void onReceiveMessageResult(ReceiveMessageResult result, String attemptId, boolean hasReceivedMessages) {
         final List<MessageViewImpl> messages = result.getMessageViewImpls();
         if (!messages.isEmpty()) {
             cacheMessages(messages);
@@ -403,7 +401,11 @@ class ProcessQueueImpl implements ProcessQueue {
             consumer.getReceivedMessagesQuantity().getAndAdd(messages.size());
             consumer.getConsumeService().consume(this, messages);
         }
-        receiveMessage();
+        if (hasReceivedMessages) {
+            receiveMessage();
+            return;
+        }
+        receiveMessage(attemptId);
     }
 
     private void evictCache(MessageViewImpl messageView) {
@@ -427,6 +429,7 @@ class ProcessQueueImpl implements ProcessQueue {
 
     @Override
     public void eraseMessage(MessageViewImpl messageView, ConsumeResult consumeResult) {
+        consumeResult = convertSuspendResultIfNeeded(consumeResult);
         statsConsumptionResult(consumeResult);
         ListenableFuture<Void> future = ConsumeResult.SUCCESS.equals(consumeResult) ? ackMessage(messageView) :
             nackMessage(messageView);
@@ -436,6 +439,12 @@ class ProcessQueueImpl implements ProcessQueue {
     private ListenableFuture<Void> nackMessage(final MessageViewImpl messageView) {
         final int deliveryAttempt = messageView.getDeliveryAttempt();
         final Duration duration = consumer.getRetryPolicy().getNextAttemptDelay(deliveryAttempt);
+        final SettableFuture<Void> future0 = SettableFuture.create();
+        changeInvisibleDuration(messageView, duration, 1, future0);
+        return future0;
+    }
+
+    private ListenableFuture<Void> changeInvisibleDuration(final MessageViewImpl messageView, final Duration duration) {
         final SettableFuture<Void> future0 = SettableFuture.create();
         changeInvisibleDuration(messageView, duration, 1, future0);
         return future0;
@@ -517,6 +526,7 @@ class ProcessQueueImpl implements ProcessQueue {
 
     @Override
     public ListenableFuture<Void> eraseFifoMessage(MessageViewImpl messageView, ConsumeResult consumeResult) {
+        consumeResult = convertSuspendResultIfNeeded(consumeResult);
         statsConsumptionResult(consumeResult);
         final RetryPolicy retryPolicy = consumer.getRetryPolicy();
         final int maxAttempts = retryPolicy.getMaxAttempts();
@@ -534,17 +544,23 @@ class ProcessQueueImpl implements ProcessQueue {
             return Futures.transformAsync(future, result -> eraseFifoMessage(messageView, result),
                 MoreExecutors.directExecutor());
         }
-        boolean ok = ConsumeResult.SUCCESS.equals(consumeResult);
-        if (!ok) {
+        ListenableFuture<Void> future;
+        if (ConsumeResult.SUCCESS.equals(consumeResult)) {
+            future = ackMessage(messageView);
+        } else if (consumeResult instanceof ConsumeResultSuspend) {
+            ConsumeResultSuspend consumeResultSuspend = (ConsumeResultSuspend) consumeResult;
+            log.info("Suspend consumption, consumerGroup={}, topic={}, liteTopic={}, messageId={}, result={}",
+                consumer.getConsumerGroup(), messageView.getTopic(), messageView.getLiteTopic().orElse(""),
+                messageView.getMessageId(), consumeResultSuspend);
+            future = changeInvisibleDuration(messageView, consumeResultSuspend.getSuspendTime());
+        } else {
             log.info("Failed to consume fifo message finally, run out of attempt times, maxAttempts={}, "
                 + "attempt={}, mq={}, messageId={}, clientId={}", maxAttempts, attempt, mq, messageId, clientId);
+            future = forwardToDeadLetterQueue(messageView);
         }
-        // Ack message or forward it to DLQ depends on consumption result.
-        ListenableFuture<Void> future = ok ? ackMessage(messageView) : forwardToDeadLetterQueue(messageView);
         future.addListener(() -> evictCache(messageView), consumer.getConsumptionExecutor());
         return future;
     }
-
 
     private ListenableFuture<Void> forwardToDeadLetterQueue(final MessageViewImpl messageView) {
         final SettableFuture<Void> future = SettableFuture.create();
@@ -718,4 +734,17 @@ class ProcessQueueImpl implements ProcessQueue {
             + "cachedMessageCount={}, cachedMessageBytes={}", consumer.getClientId(), mq, receptionTimes,
             receivedMessagesQuantity, this.getCachedMessageCount(), this.getCachedMessageBytes());
     }
+
+    private ConsumeResult convertSuspendResultIfNeeded(ConsumeResult consumeResult) {
+        if (consumeResult instanceof ConsumeResultSuspend) {
+            if (!(consumer instanceof LitePushConsumer)) {
+                log.warn("Only LitePushConsumer support ConsumeResultSuspend! " +
+                        "Convert to ConsumeResult.FAILURE, consumerGroup={}, consumerType={}",
+                    consumer.getConsumerGroup(), consumer.getClass().getSimpleName());
+                return ConsumeResult.FAILURE;
+            }
+        }
+        return consumeResult;
+    }
+
 }

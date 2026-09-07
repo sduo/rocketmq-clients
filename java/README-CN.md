@@ -6,12 +6,31 @@
 
 ## 概述
 
-不同于[基于 RemotingCommand 协议的版本](https://github.com/apache/rocketmq/tree/develop/client)，当前的客户端基于 RocektMQ 5.0 存算分离架构进行设计开发，是 RocketMQ 社区目前推荐的接入方式，也是未来客户端演进的主要方向。
+不同于[基于 RemotingCommand 协议的版本](https://github.com/apache/rocketmq/tree/develop/client)，当前的客户端基于 RocketMQ 5.0 存算分离架构进行设计开发，是 RocketMQ 社区目前推荐的接入方式，也是未来客户端演进的主要方向。
 
 在开始客户端的部分之前，所需的一些前期工作（或者参照[这里](https://rocketmq.apache.org/zh/docs/quickStart/02quickstart/)）：
 
 1. 准备 Java 环境。Java 8 是确保客户端运行的最小版本，Java 11 是确保客户端编译的最小版本；
 2. 部署 namesrv，broker 以及 [proxy](https://github.com/apache/rocketmq/tree/develop/proxy) 组件。
+
+## 从源码构建
+
+`rocketmq-proto` 模块从 `protos/` 子模块（[rocketmq-apis](https://github.com/apache/rocketmq-apis)）编译，而非从 Maven Central 下载。构建前需要先初始化子模块：
+
+```bash
+git submodule update --init protos
+```
+
+然后使用 Maven 构建：
+
+```bash
+cd java
+mvn -B package -DskipTests
+```
+
+构建顺序为：`proto`（从子模块编译）→ `client-apis` → `client` → `client-shade` → `test`。
+
+Proto 的版本号定义在 `protos/java/VERSION` 中，需要与 `java/proto/pom.xml` 的 `<version>` 保持一致。更新 proto 时，推进子模块并同步更新这两个文件。
 
 ## 快速开始
 

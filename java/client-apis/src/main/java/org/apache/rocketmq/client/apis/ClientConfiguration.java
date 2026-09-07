@@ -17,7 +17,11 @@
 
 package org.apache.rocketmq.client.apis;
 
+import com.google.common.annotations.Beta;
 import java.time.Duration;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -28,19 +32,27 @@ public class ClientConfiguration {
     private final SessionCredentialsProvider sessionCredentialsProvider;
     private final Duration requestTimeout;
     private final boolean sslEnabled;
+    private final boolean virtualThreadsEnabled;
     private final String namespace;
+    private final int maxStartupAttempts;
+    private final Map<String, String> clientProperties;
 
     /**
      * The caller is supposed to have validated the arguments and handled throwing exceptions or
      * logging warnings already, so we avoid repeating args check here.
      */
     ClientConfiguration(String endpoints, SessionCredentialsProvider sessionCredentialsProvider,
-        Duration requestTimeout, boolean sslEnabled, String namespace) {
+        Duration requestTimeout, boolean sslEnabled, boolean virtualThreadsEnabled, String namespace,
+        int maxStartupAttempts,
+        Map<String, String> clientProperties) {
         this.endpoints = endpoints;
         this.sessionCredentialsProvider = sessionCredentialsProvider;
         this.requestTimeout = requestTimeout;
         this.sslEnabled = sslEnabled;
+        this.virtualThreadsEnabled = virtualThreadsEnabled;
         this.namespace = namespace;
+        this.maxStartupAttempts = maxStartupAttempts;
+        this.clientProperties = Collections.unmodifiableMap(new LinkedHashMap<>(clientProperties));
     }
 
     public static ClientConfigurationBuilder newBuilder() {
@@ -63,7 +75,20 @@ public class ClientConfiguration {
         return sslEnabled;
     }
 
+    @Beta
+    public boolean isVirtualThreadsEnabled() {
+        return virtualThreadsEnabled;
+    }
+
     public String getNamespace() {
         return namespace;
+    }
+
+    public int getMaxStartupAttempts() {
+        return maxStartupAttempts;
+    }
+
+    public Map<String, String> getClientProperties() {
+        return clientProperties;
     }
 }

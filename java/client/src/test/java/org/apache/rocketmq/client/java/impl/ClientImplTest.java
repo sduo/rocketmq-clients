@@ -33,6 +33,7 @@ import apache.rocketmq.v2.MessageType;
 import apache.rocketmq.v2.NotifyClientTerminationRequest;
 import apache.rocketmq.v2.Permission;
 import apache.rocketmq.v2.PrintThreadStackTraceCommand;
+import apache.rocketmq.v2.ReconnectEndpointsCommand;
 import apache.rocketmq.v2.Resource;
 import apache.rocketmq.v2.TelemetryCommand;
 import apache.rocketmq.v2.VerifyMessageCommand;
@@ -118,6 +119,19 @@ public class ClientImplTest extends TestBase {
     }
 
     @Test
+    public void testOnReconnectEndpointsCommand() {
+        final Endpoints endpoints = fakeEndpoints();
+        final ReconnectEndpointsCommand command = ReconnectEndpointsCommand.newBuilder().build();
+        final ClientManager clientManager = Mockito.mock(ClientManager.class);
+        final ClientImpl client = createClient();
+        doReturn(clientManager).when(client).getClientManager();
+
+        client.onReconnectEndpointsCommand(endpoints, command);
+
+        verify(clientManager, times(1)).reconnect(eq(endpoints));
+    }
+
+    @Test
     public void testOnTopicRouteDataFetchedFailure() throws ClientException {
         String topic = FAKE_TOPIC_0;
         List<MessageQueue> messageQueueList = new ArrayList<>();
@@ -143,5 +157,19 @@ public class ClientImplTest extends TestBase {
             verify(client, times(1)).telemetry(any(Endpoints.class), any(StreamObserver.class));
             verify(observer, times(1)).onNext(any(TelemetryCommand.class));
         }
+    }
+
+    @Test
+    public void testCheckRunningWhenRunning() {
+        final ClientImpl client = createClient();
+        doReturn(true).when(client).isRunning();
+        client.checkRunning();
+    }
+
+    @Test(expected = IllegalStateException.class)
+    public void testCheckRunningWhenNotRunning() {
+        final ClientImpl client = createClient();
+        doReturn(false).when(client).isRunning();
+        client.checkRunning();
     }
 }

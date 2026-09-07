@@ -51,6 +51,9 @@ type isClient interface {
 	onRecoverOrphanedTransactionCommand(endpoints *v2.Endpoints, command *v2.RecoverOrphanedTransactionCommand) error
 	onVerifyMessageCommand(endpoints *v2.Endpoints, command *v2.VerifyMessageCommand) error
 	IsEndpointUpdated() bool
+	isRunning() bool
+	getClient() *defaultClient
+	getRequestTimeout() time.Duration
 }
 type defaultClientSession struct {
 	endpoints        *v2.Endpoints
@@ -117,6 +120,13 @@ func (cs *defaultClientSession) startUp() {
 
 			response, err := observer.Recv()
 			if err != nil {
+				// If the client has not yet initialized, propagate the error to startUp() so it can
+				// return immediately instead of blocking forever waiting for settings.
+				if !cs.cli.inited.Load() {
+					cs.cli.startUpError = fmt.Errorf("failed to sync settings during startUp: %w", err)
+					cs.cli.log.Error(cs.cli.startUpError)
+					return
+				}
 				// we are recovering
 				if !cs.recovering {
 					cs.cli.log.Infof("Encountered error while receiving TelemetryCommand, trying to recover, err=%v", err)
@@ -137,8 +147,7 @@ func (cs *defaultClientSession) startUp() {
 				// we assume that the list of the servers hasn't changed, so the server that sent the message is still present.
 				hearbeat_response, err := cs.cli.clientManager.HeartBeat(context.TODO(), cs.endpoints, &v2.HeartbeatRequest{}, 10*time.Second)
 				if err == nil && hearbeat_response.Status.Code == v2.Code_OK {
-					cs.cli.log.Info("Managed to recover, executing message")
-					cs._execute_server_telemetry_command(response)
+					cs.cli.log.Info("Managed to recover")
 				} else {
 					cs.cli.log.Errorf("Failed to recover, Some of the servers are unhealthy, Heartbeat err=%w", err)
 					cs.release()
@@ -165,6 +174,8 @@ func (cs *defaultClientSession) handleTelemetryCommand(response *v2.TelemetryCom
 		cs.cli.onPrintThreadStackTraceCommand(cs.endpoints, c.PrintThreadStackTraceCommand)
 	case *v2.TelemetryCommand_ReconnectEndpointsCommand:
 		cs.cli.onReconnectEndpointsCommand(cs.endpoints, c.ReconnectEndpointsCommand)
+	case *v2.TelemetryCommand_NotifyUnsubscribeLiteCommand:
+		cs.cli.onNotifyUnsubscribeLiteCommand(cs.endpoints, c.NotifyUnsubscribeLiteCommand)
 	default:
 		return fmt.Errorf("receive unrecognized command from remote, endpoints=%v, command=%v, clientId=%s", cs.endpoints, command, cs.cli.clientID)
 	}
@@ -173,10 +184,12 @@ func (cs *defaultClientSession) handleTelemetryCommand(response *v2.TelemetryCom
 func (cs *defaultClientSession) release() {
 	cs.observerLock.Lock()
 	defer cs.observerLock.Unlock()
-	if err := cs.observer.CloseSend(); err != nil {
-		cs.cli.log.Errorf("release defaultClientSession err=%v", err)
+	if cs.observer != nil {
+		if err := cs.observer.CloseSend(); err != nil {
+			cs.cli.log.Errorf("release defaultClientSession err=%v", err)
+		}
+		cs.observer = nil
 	}
-	cs.observer = nil
 }
 func (cs *defaultClientSession) publish(ctx context.Context, common *v2.TelemetryCommand) error {
 	var err error
@@ -229,8 +242,10 @@ type defaultClient struct {
 	endpointsTelemetryClientsLock sync.RWMutex
 	on                            atomic.Bool
 	inited                        atomic.Bool
+	startUpError                  error
 	clientImpl                    isClient
 	ReceiveReconnect              bool
+	notifyUnsubscribeLiteFunc     func(*v2.NotifyUnsubscribeLiteCommand)
 }
 
 var NewClient = func(config *Config, opts ...ClientOption) (Client, error) {
@@ -569,14 +584,15 @@ func (cli *defaultClient) startUp() error {
 						impl.publishingRouteDataResultCache.Store(topic, existing.(PublishingLoadBalancer).CopyAndUpdate(newRoute))
 					}
 				case *defaultSimpleConsumer:
+					filteredRoute := impl.filterTopicRouteData(newRoute)
 					existing, ok := impl.subTopicRouteDataResultCache.Load(topic)
 					if !ok {
-						slb, err := NewSubscriptionLoadBalancer(newRoute)
+						slb, err := NewSubscriptionLoadBalancer(filteredRoute)
 						if err == nil {
 							impl.subTopicRouteDataResultCache.Store(topic, slb)
 						}
 					} else {
-						impl.subTopicRouteDataResultCache.Store(topic, existing.(SubscriptionLoadBalancer).CopyAndUpdate(newRoute))
+						impl.subTopicRouteDataResultCache.Store(topic, existing.(SubscriptionLoadBalancer).CopyAndUpdate(filteredRoute))
 					}
 				}
 			}
@@ -587,6 +603,9 @@ func (cli *defaultClient) startUp() error {
 
 	// wait syncSettings finish
 	for !cli.inited.Load() {
+		if cli.startUpError != nil {
+			return cli.startUpError
+		}
 		sugarBaseLogger.Infoln("wait for sync settings finish")
 		time.Sleep(time.Second)
 	}
@@ -607,23 +626,41 @@ func routeEqual(old, new []*v2.MessageQueue) bool {
 }
 
 func (cli *defaultClient) notifyClientTermination() {
-	cli.log.Info("start notifyClientTermination")
 	ctx := cli.Sign(context.Background())
-	request := &v2.NotifyClientTerminationRequest{}
+	request := &v2.NotifyClientTerminationRequest{
+		Group: &v2.Resource{
+			ResourceNamespace: cli.config.NameSpace,
+			Name:              cli.config.ConsumerGroup,
+		},
+	}
 	targets := cli.getTotalTargets()
 	for _, target := range targets {
-		endpoints, err := utils.ParseTarget(target)
+		endpoints, _ := utils.ParseTarget(target)
+		if endpoints == nil {
+			continue
+		}
+		cli.log.Infof("start notifyClientTermination, endpoints=%s", utils.EndpointsToString(endpoints))
+		_, err := cli.clientManager.NotifyClientTermination(ctx, endpoints, request, cli.opts.timeout)
 		if err != nil {
-			cli.clientManager.NotifyClientTermination(ctx, endpoints, request, cli.opts.timeout)
+			cli.log.Errorf("failed to notify client termination, endpoints=%s, error=%v", utils.EndpointsToString(endpoints), err)
 		}
 	}
 }
+
 func (cli *defaultClient) GracefulStop() error {
 	if !cli.on.CAS(true, false) {
 		return fmt.Errorf("client has been closed")
 	}
 	cli.notifyClientTermination()
-	cli.clientManager.UnRegisterClient(cli)
+	cli.endpointsTelemetryClientsLock.Lock()
+	for _, session := range cli.endpointsTelemetryClientTable {
+		session.release()
+	}
+	cli.endpointsTelemetryClientTable = make(map[string]*defaultClientSession)
+	cli.endpointsTelemetryClientsLock.Unlock()
+	if cli.clientManager != nil {
+		cli.clientManager.shutdown()
+	}
 	cli.done <- struct{}{}
 	close(cli.done)
 	cli.clientMeterProvider.Reset(&v2.Metric{
@@ -638,6 +675,25 @@ func (cli *defaultClient) isRunning() bool {
 
 func (cli *defaultClient) Sign(ctx context.Context) context.Context {
 	now := time.Now().Format("20060102T150405Z")
+	if cli.config.Credentials == nil {
+		// if no credentials, do not sign
+		return metadata.AppendToOutgoingContext(ctx,
+			innerMD.LanguageKey,
+			innerMD.LanguageValue,
+			innerMD.ProtocolKey,
+			innerMD.ProtocolValue,
+			innerMD.RequestID,
+			uuid.New().String(),
+			innerMD.VersionKey,
+			innerMD.VersionValue,
+			innerMD.ClintID,
+			cli.clientID,
+			innerMD.NameSpace,
+			cli.config.NameSpace,
+			innerMD.DateTime,
+			now,
+		)
+	}
 	return metadata.AppendToOutgoingContext(ctx,
 		innerMD.LanguageKey,
 		innerMD.LanguageValue,
@@ -711,6 +767,10 @@ func (cli *defaultClient) onVerifyMessageCommand(endpoints *v2.Endpoints, comman
 		target := utils.ParseAddress(address)
 		cli.telemeter(target, req)
 	}
+}
+
+func (cli *defaultClient) onNotifyUnsubscribeLiteCommand(endpoints *v2.Endpoints, command *v2.NotifyUnsubscribeLiteCommand) {
+	cli.notifyUnsubscribeLiteFunc(command)
 }
 
 func (cli *defaultClient) onPrintThreadStackTraceCommand(endpoints *v2.Endpoints, command *v2.PrintThreadStackTraceCommand) {

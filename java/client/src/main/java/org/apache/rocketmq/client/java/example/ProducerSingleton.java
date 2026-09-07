@@ -54,6 +54,12 @@ public class ProducerSingleton {
             // On some Windows platforms, you may encounter SSL compatibility issues. Try turning off the SSL option in
             // client configuration to solve the problem please if SSL is not essential.
             // .enableSsl(false)
+            // Due to the lazy loading of gRPC, when the network conditions are poor or the load of the application
+            // at startup is high, the first startup may fail, and you can try multiple startups.
+            // .setMaxStartupAttempts(3)
+            // Set optional opaque client properties for server-side observability.
+            // .addClientProperty("key1", "value1")
+            // .addClientProperty("key2", "value2")
             .setCredentialProvider(sessionCredentialsProvider)
             .build();
         final ProducerBuilder builder = provider.newProducerBuilder()

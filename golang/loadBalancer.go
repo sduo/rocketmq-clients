@@ -73,7 +73,7 @@ func (plb *publishingLoadBalancer) TakeMessageQueues(excluded *sync.Map, count i
 	candidateBrokerNames := make(map[string]bool, 32)
 
 	for i := 0; i < len(plb.messageQueues); i++ {
-		idx := utils.Mod(next+1, len(plb.messageQueues))
+		idx := utils.Mod(next+int32(i), len(plb.messageQueues))
 		selectMessageQueue := plb.messageQueues[idx]
 		broker := selectMessageQueue.Broker
 		brokerName := broker.GetName()
@@ -102,7 +102,7 @@ func (plb *publishingLoadBalancer) TakeMessageQueues(excluded *sync.Map, count i
 	}
 	if len(candidates) == 0 {
 		for i := 0; i < len(plb.messageQueues); i++ {
-			idx := utils.Mod(next+1, len(plb.messageQueues))
+			idx := utils.Mod(next+int32(i), len(plb.messageQueues))
 			selectMessageQueue := plb.messageQueues[idx]
 			broker := selectMessageQueue.Broker
 			brokerName := broker.GetName()
@@ -131,6 +131,14 @@ func (plb *publishingLoadBalancer) CopyAndUpdate(messageQueues []*v2.MessageQueu
 type SubscriptionLoadBalancer interface {
 	TakeMessageQueue() (*v2.MessageQueue, error)
 	CopyAndUpdate([]*v2.MessageQueue) SubscriptionLoadBalancer
+}
+
+// isReadableMasterQueue checks if the message queue is readable and belongs to the master broker.
+func isReadableMasterQueue(mq *v2.MessageQueue) bool {
+	permission := mq.GetPermission()
+	readable := permission == v2.Permission_READ || permission == v2.Permission_READ_WRITE
+	// master broker id is 0
+	return readable && mq.GetBroker().GetId() == 0
 }
 
 type subscriptionLoadBalancer struct {

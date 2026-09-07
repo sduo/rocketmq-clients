@@ -70,6 +70,8 @@ type defaultPushConsumer struct {
 
 	stopping                        atomic.Bool
 	inflightRequestCountInterceptor *defultInflightRequestCountInterceptor
+
+	pushConsumerExtension PushConsumerExtension
 }
 
 func (pc *defaultPushConsumer) SetRequestTimeout(timeout time.Duration) {
@@ -79,6 +81,22 @@ func (pc *defaultPushConsumer) SetRequestTimeout(timeout time.Duration) {
 
 func (pc *defaultPushConsumer) isOn() bool {
 	return pc.cli.on.Load()
+}
+
+func (pc *defaultPushConsumer) isRunning() bool {
+	// graceful stop in pushConsumer
+	if pc.stopping.Load() {
+		return false
+	}
+	return pc.cli.isRunning()
+}
+
+func (pc *defaultPushConsumer) getClient() *defaultClient {
+	return pc.cli
+}
+
+func (pc *defaultPushConsumer) getRequestTimeout() time.Duration {
+	return pc.pcSettings.requestTimeout
 }
 
 func (pc *defaultPushConsumer) changeInvisibleDuration0(context context.Context, messageView *MessageView, invisibleDuration time.Duration) (*v2.ChangeInvisibleDurationResponse, error) {
@@ -103,6 +121,14 @@ func (pc *defaultPushConsumer) changeInvisibleDuration0(context context.Context,
 		InvisibleDuration: durationpb.New(invisibleDuration),
 		MessageId:         messageView.GetMessageId(),
 	}
+
+	// Set LiteTopic only for lite consumer
+	if messageView.GetLiteTopic() != "" && pc.pcSettings.GetClientType() == v2.ClientType_LITE_PUSH_CONSUMER {
+		request.LiteTopic = &messageView.liteTopic
+		suspend := true
+		request.Suspend = &suspend
+	}
+
 	watchTime := time.Now()
 	resp, err := pc.cli.clientManager.ChangeInvisibleDuration(ctx, endpoints, request, pc.pcSettings.requestTimeout)
 	duration := time.Since(watchTime)
@@ -167,53 +193,27 @@ func (pc *defaultPushConsumer) Unsubscribe(topic string) error {
 }
 
 func (pc *defaultPushConsumer) wrapReceiveMessageRequest(batchSize int, messageQueue *v2.MessageQueue, filterExpression *FilterExpression, longPollingTimeout time.Duration) *v2.ReceiveMessageRequest {
-	return pc.wrapReceiveMessageRequestWithAttemptId(batchSize, messageQueue, filterExpression, longPollingTimeout, "")
-}
-
-func (pc *defaultPushConsumer) wrapReceiveMessageRequestWithAttemptId(batchSize int, messageQueue *v2.MessageQueue, filterExpression *FilterExpression, longPollingTimeout time.Duration, attemptId string) *v2.ReceiveMessageRequest {
-	if len(attemptId) == 0 {
-		attemptId = uuid.New().String()
-	}
-	var filterType v2.FilterType
-	switch filterExpression.expressionType {
-	case SQL92:
-		filterType = v2.FilterType_SQL
-	case TAG:
-		filterType = v2.FilterType_TAG
-	default:
-		filterType = v2.FilterType_FILTER_TYPE_UNSPECIFIED
-	}
-
-	return &v2.ReceiveMessageRequest{
-		Group: &v2.Resource{
-			Name:              pc.groupName,
-			ResourceNamespace: pc.cli.config.NameSpace,
-		},
-		MessageQueue: messageQueue,
-		FilterExpression: &v2.FilterExpression{
-			Expression: filterExpression.expression,
-			Type:       filterType,
-		},
-		LongPollingTimeout: durationpb.New(longPollingTimeout),
-		BatchSize:          int32(batchSize),
-		AutoRenew:          true,
-		AttemptId:          &attemptId,
-	}
+	return pc.pushConsumerExtension.WrapReceiveMessageRequest(batchSize, messageQueue, filterExpression, longPollingTimeout)
 }
 
 func (pc *defaultPushConsumer) wrapAckMessageRequest(messageView *MessageView) *v2.AckMessageRequest {
+	entry := &v2.AckMessageEntry{
+		MessageId:     messageView.GetMessageId(),
+		ReceiptHandle: messageView.GetReceiptHandle(),
+	}
+
+	// Set LiteTopic only for lite consumer
+	if messageView.GetLiteTopic() != "" && pc.pcSettings.GetClientType() == v2.ClientType_LITE_PUSH_CONSUMER {
+		entry.LiteTopic = &messageView.liteTopic
+	}
+
 	return &v2.AckMessageRequest{
 		Group: pc.pcSettings.groupName,
 		Topic: &v2.Resource{
 			Name:              messageView.GetTopic(),
 			ResourceNamespace: pc.cli.config.NameSpace,
 		},
-		Entries: []*v2.AckMessageEntry{
-			{
-				MessageId:     messageView.GetMessageId(),
-				ReceiptHandle: messageView.GetReceiptHandle(),
-			},
-		},
+		Entries: []*v2.AckMessageEntry{entry},
 	}
 }
 
@@ -222,7 +222,6 @@ func (pc *defaultPushConsumer) GetGroupName() string {
 }
 
 func (pc *defaultPushConsumer) receiveMessage(ctx context.Context, request *v2.ReceiveMessageRequest, messageQueue *v2.MessageQueue, timeout time.Duration) ([]*MessageView, error) {
-	var err error
 	ctx = pc.cli.Sign(ctx)
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -231,34 +230,38 @@ func (pc *defaultPushConsumer) receiveMessage(ctx context.Context, request *v2.R
 	if err != nil {
 		return nil, err
 	}
-	done := make(chan bool, 1)
+	type receiveResult struct {
+		responses []*v2.ReceiveMessageResponse
+		err       error
+	}
+	done := make(chan receiveResult, 1)
 
-	resps := make([]*v2.ReceiveMessageResponse, 0)
 	go func() {
+		var resps []*v2.ReceiveMessageResponse
+		var recvErr error
 		for {
 			var resp *v2.ReceiveMessageResponse
-			resp, err = receiveMessageClient.Recv()
-			if err == io.EOF {
-				done <- true
-				defer close(done)
+			resp, recvErr = receiveMessageClient.Recv()
+			if recvErr == io.EOF {
+				done <- receiveResult{responses: resps}
 				break
 			}
-			if err != nil {
-				pc.cli.log.Errorf("pushConsumer recv msg err=%v, requestId=%s", err, utils.GetRequestID(ctx))
+			if recvErr != nil {
+				pc.cli.log.Errorf("pushConsumer recv msg err=%v, requestId=%s", recvErr, utils.GetRequestID(ctx))
+				done <- receiveResult{err: recvErr}
 				break
 			}
 			sugarBaseLogger.Debugf("receiveMessage response: %v", resp)
 			resps = append(resps, resp)
 		}
-		cancel()
 	}()
 	select {
 	case <-ctx.Done():
 		// timeout
 		return nil, fmt.Errorf("[error] CODE=DEADLINE_EXCEEDED")
-	case <-done:
-		if err != nil && err != io.EOF {
-			return nil, err
+	case result := <-done:
+		if result.err != nil {
+			return nil, result.err
 		}
 		messageViewList := make([]*MessageView, 0)
 		status := &v2.Status{
@@ -267,7 +270,7 @@ func (pc *defaultPushConsumer) receiveMessage(ctx context.Context, request *v2.R
 		}
 		var deliveryTimestamp *timestamppb.Timestamp
 		messageList := make([]*v2.Message, 0)
-		for _, resp := range resps {
+		for _, resp := range result.responses {
 			switch r := resp.GetContent().(type) {
 			case *v2.ReceiveMessageResponse_Status:
 				status = r.Status
@@ -307,13 +310,14 @@ func (pc *defaultPushConsumer) onVerifyMessageCommand(endpoints *v2.Endpoints, c
 }
 
 func (pc *defaultPushConsumer) wrapHeartbeatRequest() *v2.HeartbeatRequest {
-	return &v2.HeartbeatRequest{
-		Group:      pc.pcSettings.groupName,
-		ClientType: v2.ClientType_SIMPLE_CONSUMER,
-	}
+	return pc.pushConsumerExtension.WrapHeartbeatRequest()
 }
 
 var NewPushConsumer = func(config *Config, opts ...PushConsumerOption) (PushConsumer, error) {
+	return newPushConsumer(config, opts...)
+}
+
+var newPushConsumer = func(config *Config, opts ...PushConsumerOption) (*defaultPushConsumer, error) {
 	copyOpt := defaultPushConsumerOptions
 	pcOpts := &copyOpt
 	for _, opt := range opts {
@@ -349,6 +353,7 @@ var NewPushConsumer = func(config *Config, opts ...PushConsumerOption) (PushCons
 		stopping:                        *atomic.NewBool(false),
 		inflightRequestCountInterceptor: NewDefultInflightRequestCountInterceptor(),
 	}
+	pc.pushConsumerExtension = pc
 	pc.cli.initTopics = make([]string, 0)
 	pcOpts.subscriptionExpressions.Range(func(key, value interface{}) bool {
 		pc.cli.initTopics = append(pc.cli.initTopics, key.(string))
@@ -388,8 +393,13 @@ func (pc *defaultPushConsumer) Start() error {
 
 	threadPool := NewSimpleThreadPool("MessageConsumption", int(pc.pcOpts.maxCacheMessageCount), int(pc.pcOpts.consumptionThreadCount))
 	if pc.pcSettings.isFifo {
-		pc.consumerService = NewFiFoConsumeService(pc.cli.clientID, pc.pcOpts.messageListener, threadPool, pc.cli, pc.pcOpts.enableFifoConsumeAccelerator)
-		pc.cli.log.Infof("Create FIFO consume service, consumerGroup=%s, clientId=%s, enableFifoConsumeAccelerator=%t", pc.cli.config.ConsumerGroup, pc.cli.clientID, pc.pcOpts.enableFifoConsumeAccelerator)
+		if pc.pcSettings.GetClientType() == v2.ClientType_LITE_PUSH_CONSUMER {
+			pc.consumerService = NewLiteFifoConsumeService(pc.cli.clientID, pc.pcOpts.messageListener, threadPool, pc.cli, pc.pcOpts.enableFifoConsumeAccelerator)
+			pc.cli.log.Infof("Create Lite FIFO consume service, consumerGroup=%s, clientId=%s, enableFifoConsumeAccelerator=%t", pc.cli.config.ConsumerGroup, pc.cli.clientID, pc.pcOpts.enableFifoConsumeAccelerator)
+		} else {
+			pc.consumerService = NewFiFoConsumeService(pc.cli.clientID, pc.pcOpts.messageListener, threadPool, pc.cli, pc.pcOpts.enableFifoConsumeAccelerator)
+			pc.cli.log.Infof("Create FIFO consume service, consumerGroup=%s, clientId=%s, enableFifoConsumeAccelerator=%t", pc.cli.config.ConsumerGroup, pc.cli.clientID, pc.pcOpts.enableFifoConsumeAccelerator)
+		}
 	} else {
 		pc.consumerService = NewStandardConsumeService(pc.cli.clientID, pc.pcOpts.messageListener, threadPool, pc.cli)
 		pc.cli.log.Infof("Create standard consume service, consumerGroup=%s, clientId=%s", pc.cli.config.ConsumerGroup, pc.cli.clientID)
@@ -526,7 +536,9 @@ func (pc *defaultPushConsumer) GracefulStop() error {
 	pc.cli.log.Infof("Begin to Shutdown consumption executor, clientId=%s", pc.cli.clientID)
 
 	// step 4
-	pc.consumerService.Shutdown()
+	if pc.consumerService != nil {
+		pc.consumerService.Shutdown()
+	}
 
 	// step 5
 	time.Sleep(time.Second)
@@ -588,13 +600,14 @@ func (pc *defaultPushConsumer) Ack(ctx context.Context, messageView *MessageView
 	resp, err := pc.ack0(ctx, messageView)
 	duration := time.Since(watchTime)
 
-	messageHookPointsStatus := MessageHookPointsStatus_ERROR
+	messageHookPointsStatus := MessageHookPointsStatus_OK
 	if err != nil {
+		messageHookPointsStatus = MessageHookPointsStatus_ERROR
 		pc.cli.doAfter(MessageHookPoints_ACK, messageCommons, duration, messageHookPointsStatus)
 		return err
 	}
 	if resp.GetStatus().GetCode() != v2.Code_OK {
-		messageHookPointsStatus = MessageHookPointsStatus_OK
+		messageHookPointsStatus = MessageHookPointsStatus_ERROR
 	}
 	pc.cli.doAfter(MessageHookPoints_ACK, messageCommons, duration, messageHookPointsStatus)
 	return nil
@@ -611,7 +624,7 @@ func (pc *defaultPushConsumer) ack0(ctx context.Context, messageView *MessageVie
 }
 
 func (pc *defaultPushConsumer) wrapForwardMessageToDeadLetterQueueRequest(messageView *MessageView) *v2.ForwardMessageToDeadLetterQueueRequest {
-	return &v2.ForwardMessageToDeadLetterQueueRequest{
+	request := &v2.ForwardMessageToDeadLetterQueueRequest{
 		Group: pc.pcSettings.groupName,
 		Topic: &v2.Resource{
 			Name:              messageView.GetTopic(),
@@ -622,6 +635,13 @@ func (pc *defaultPushConsumer) wrapForwardMessageToDeadLetterQueueRequest(messag
 		DeliveryAttempt:     messageView.GetDeliveryAttempt(),
 		MaxDeliveryAttempts: pc.pcSettings.GetRetryPolicy().MaxAttempts,
 	}
+
+	// Set LiteTopic only for lite consumer
+	if messageView.GetLiteTopic() != "" && pc.pcSettings.GetClientType() == v2.ClientType_LITE_PUSH_CONSUMER {
+		request.LiteTopic = &messageView.liteTopic
+	}
+
+	return request
 }
 
 func (pc *defaultPushConsumer) ForwardMessageToDeadLetterQueue(ctx context.Context, messageView *MessageView) error {
@@ -632,13 +652,14 @@ func (pc *defaultPushConsumer) ForwardMessageToDeadLetterQueue(ctx context.Conte
 	resp, err := pc.forwardMessageToDeadLetterQueue0(ctx, messageView)
 	duration := time.Since(watchTime)
 
-	messageHookPointsStatus := MessageHookPointsStatus_ERROR
+	messageHookPointsStatus := MessageHookPointsStatus_OK
 	if err != nil {
+		messageHookPointsStatus = MessageHookPointsStatus_ERROR
 		pc.cli.doAfter(MessageHookPoints_FORWARD_TO_DLQ, messageCommons, duration, messageHookPointsStatus)
 		return err
 	}
 	if resp.GetStatus().GetCode() != v2.Code_OK {
-		messageHookPointsStatus = MessageHookPointsStatus_OK
+		messageHookPointsStatus = MessageHookPointsStatus_ERROR
 	}
 	pc.cli.doAfter(MessageHookPoints_FORWARD_TO_DLQ, messageCommons, duration, messageHookPointsStatus)
 	return nil
@@ -649,14 +670,6 @@ func (pc *defaultPushConsumer) forwardMessageToDeadLetterQueue0(ctx context.Cont
 	request := pc.wrapForwardMessageToDeadLetterQueueRequest(messageView)
 	ctx = pc.cli.Sign(ctx)
 	return pc.cli.clientManager.ForwardMessageToDeadLetterQueue(ctx, endpoints, request, pc.cli.opts.timeout)
-}
-
-func (pc *defaultPushConsumer) isRunning() bool {
-	// graceful stop in pushConsumer
-	if pc.stopping.Load() {
-		return false
-	}
-	return pc.cli.isRunning()
 }
 
 func (pc *defaultPushConsumer) getQueueSize() int32 {
@@ -717,4 +730,47 @@ func (pc *defaultPushConsumer) IsEndpointUpdated() bool {
 
 func (sc *defaultPushConsumer) SetReceiveReconnect(receiveReconnect bool) {
 	sc.cli.ReceiveReconnect = receiveReconnect
+}
+
+type PushConsumerExtension interface {
+	WrapReceiveMessageRequest(int, *v2.MessageQueue, *FilterExpression, time.Duration) *v2.ReceiveMessageRequest
+	WrapHeartbeatRequest() *v2.HeartbeatRequest
+}
+
+var _ = PushConsumerExtension(&defaultPushConsumer{})
+
+func (pc *defaultPushConsumer) WrapReceiveMessageRequest(batchSize int, messageQueue *v2.MessageQueue, filterExpression *FilterExpression, longPollingTimeout time.Duration) *v2.ReceiveMessageRequest {
+	attemptId := uuid.New().String()
+	var filterType v2.FilterType
+	switch filterExpression.expressionType {
+	case SQL92:
+		filterType = v2.FilterType_SQL
+	case TAG:
+		filterType = v2.FilterType_TAG
+	default:
+		filterType = v2.FilterType_FILTER_TYPE_UNSPECIFIED
+	}
+
+	return &v2.ReceiveMessageRequest{
+		Group: &v2.Resource{
+			Name:              pc.groupName,
+			ResourceNamespace: pc.cli.config.NameSpace,
+		},
+		MessageQueue: messageQueue,
+		FilterExpression: &v2.FilterExpression{
+			Expression: filterExpression.expression,
+			Type:       filterType,
+		},
+		LongPollingTimeout: durationpb.New(longPollingTimeout),
+		BatchSize:          int32(batchSize),
+		AutoRenew:          true,
+		AttemptId:          &attemptId,
+	}
+}
+
+func (pc *defaultPushConsumer) WrapHeartbeatRequest() *v2.HeartbeatRequest {
+	return &v2.HeartbeatRequest{
+		Group:      pc.pcSettings.groupName,
+		ClientType: v2.ClientType_PUSH_CONSUMER,
+	}
 }

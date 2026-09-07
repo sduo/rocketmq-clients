@@ -45,19 +45,18 @@ if __name__ == '__main__':
                 msg.topic = topic
                 msg.body = "hello, rocketmq.".encode('utf-8')
                 # secondary classifier of message besides topic
-                msg.tag = "rocketmq-send-message"
+                msg.tag = "tag"
                 # key(s) of the message, another way to mark message besides message id
-                msg.keys = "send_async"
+                msg.keys = "keys"
                 # user property for the message
                 msg.add_property("send", "async")
                 send_result_future = producer.send_async(msg)
                 send_result_future.add_done_callback(handle_send_result)
         except Exception as e:
-            print(f"producer{producer.__str__()} send message raise exception: {e}")
-            producer.shutdown()
+            print(f"{producer} raise exception: {e}")
     except Exception as e:
-        print(f"{producer.__str__()} startup raise exception: {e}")
-        producer.shutdown()
+        print(f"{producer} startup raise exception: {e}")
 
     input("Please Enter to Stop the Application.")
     producer.shutdown()
+    print(f"{producer} shutdown.")

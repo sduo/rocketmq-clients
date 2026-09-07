@@ -76,43 +76,44 @@ void SimpleConsumerImpl::topicsOfInterest(std::vector<std::string> &topics) {
   }
 }
 
-/**
- * @brief Start SimpleConsumer
- *
- * During start, we need synchronously fetch routes and query assignments
- */
 void SimpleConsumerImpl::start() {
   ClientImpl::start();
-  State expected = State::STARTING;
-  if (state_.compare_exchange_strong(expected, State::STARTED, std::memory_order_relaxed)) {
-    client_config_.subscriber.group.set_resource_namespace(resourceNamespace());
-    refreshAssignments();
 
-    std::weak_ptr<SimpleConsumerImpl> consumer(shared_from_this());
-    auto refresh_assignment_task = [consumer]() {
-      auto simple_consumer = consumer.lock();
-      if (simple_consumer) {
-        simple_consumer->refreshAssignments0();
-      }
-    };
-
-    // refer java sdk: set refresh interval to 5 seconds
-    // org.apache.rocketmq.client.java.impl.ClientImpl#startUp
-    refresh_assignment_task_ = manager()->getScheduler()->schedule(
-        refresh_assignment_task, "RefreshAssignmentTask",
-        std::chrono::seconds(5), std::chrono::seconds(5));
-
-    client_manager_->addClientObserver(shared_from_this());
+  State expected = State::CREATED;
+  if (!state_.compare_exchange_strong(expected, State::STARTED)) {
+    SPDLOG_ERROR("SimpleConsumer started with unexpected state. Expecting: {}, Actual: {}", State::CREATED,
+                 state_.load(std::memory_order_relaxed));
+    return;
   }
+
+  client_config_.subscriber.group.set_resource_namespace(resourceNamespace());
+  refreshAssignments();
+
+  std::weak_ptr<SimpleConsumerImpl> consumer(shared_from_this());
+  auto refresh_assignment_task = [consumer]() {
+    auto simple_consumer = consumer.lock();
+    if (simple_consumer) {
+      simple_consumer->refreshAssignments0();
+    }
+  };
+
+  // refer java sdk: set refresh interval to 5 seconds
+  // org.apache.rocketmq.client.java.impl.ClientImpl#startUp
+  refresh_assignment_task_ = manager()->getScheduler()->schedule(
+      refresh_assignment_task, "RefreshAssignmentTask",
+      std::chrono::seconds(5), std::chrono::seconds(5));
+
+  client_manager_->addClientObserver(shared_from_this());
 }
 
-void SimpleConsumerImpl::shutdown() {
+void SimpleConsumerImpl::shutdown() noexcept {
   State expected = State::STARTED;
-
-  if (state_.compare_exchange_strong(expected, State::STOPPING, std::memory_order_relaxed)) {
-    manager()->getScheduler()->cancel(refresh_assignment_task_);
-    ClientImpl::shutdown();
+  if (!state_.compare_exchange_strong(expected, State::STOPPED)) {
+    return;
   }
+
+  manager()->getScheduler()->cancel(refresh_assignment_task_);
+  ClientImpl::shutdown();
 }
 
 void SimpleConsumerImpl::subscribe(std::string topic, FilterExpression expression) {
@@ -199,7 +200,10 @@ void SimpleConsumerImpl::updateAssignments(const std::string& topic, const std::
         changed = true;
         absl::MutexLock lk(&assignments_mtx_);
         for (const auto& item : to_remove) {
-          std::remove_if(assignments_.begin(), assignments_.end(), [&](const rmq::Assignment& e) { return e == item; });
+          assignments_.erase(
+              std::remove_if(assignments_.begin(), assignments_.end(),
+                             [&](const rmq::Assignment& e) { return e == item; }),
+              assignments_.end());
         }
 
         for (const auto& item : to_add) {
@@ -242,6 +246,10 @@ void SimpleConsumerImpl::refreshAssignment(const std::string& topic, std::functi
   std::weak_ptr<SimpleConsumerImpl> consumer(shared_from_this());
   auto callback = [consumer, topic, cb](const std::error_code& ec, const rmq::QueryAssignmentResponse& response) {
     auto simple_consumer = consumer.lock();
+    if (!simple_consumer) {
+      SPDLOG_WARN("SimpleConsumer has been destructed, dropping assignment response");
+      return;
+    }
     const auto& assignments = response.assignments();
     if (assignments.empty()) {
       cb(ec);
@@ -290,6 +298,17 @@ void SimpleConsumerImpl::refreshAssignments() {
   }
 }
 
+absl::optional<FilterExpression> SimpleConsumerImpl::getFilterExpression(const std::string &topic) const {
+  {
+    absl::MutexLock lk(&subscriptions_mtx_);
+    auto it = subscriptions_.find(topic);
+    if (it != subscriptions_.end()) {
+      return absl::make_optional(it->second);
+    }
+    return absl::nullopt;
+  }
+}
+
 void SimpleConsumerImpl::receive(std::size_t limit,
                                  std::chrono::milliseconds invisible_duration,
                                  ReceiveCallback callback) {
@@ -331,8 +350,24 @@ void SimpleConsumerImpl::receive(std::size_t limit,
   request.mutable_message_queue()->CopyFrom(assignment.message_queue());
   request.set_batch_size((int32_t) limit);
 
-  request.mutable_filter_expression()->set_type(rmq::FilterType::TAG);
-  request.mutable_filter_expression()->set_expression("*");
+  auto filter_expression = request.mutable_filter_expression();
+  auto&& optional = getFilterExpression(assignment.message_queue().topic().name());
+  if (optional.has_value()) {
+    auto expression = optional.value();
+    switch (expression.type_) {
+      case TAG:
+        filter_expression->set_type(rmq::FilterType::TAG);
+        filter_expression->set_expression(expression.content_);
+        break;
+      case SQL92:
+        filter_expression->set_type(rmq::FilterType::SQL);
+        filter_expression->set_expression(expression.content_);
+        break;
+    }
+  } else {
+    filter_expression->set_type(rmq::FilterType::TAG);
+    filter_expression->set_expression("*");
+  }
 
   auto invisible_duration_request =
       google::protobuf::util::TimeUtil::MillisecondsToDuration(invisible_duration.count());
@@ -411,7 +446,7 @@ void SimpleConsumerImpl::ackAsync(const Message& message, AckCallback callback) 
 
 void SimpleConsumerImpl::changeInvisibleDuration(const Message& message, std::string& receipt_handle,
                                                  std::chrono::milliseconds duration,
-                                                 const ChangeInvisibleDurationCallback callback) {
+                                                 ChangeInvisibleDurationCallback callback) {
   Metadata metadata;
   Signature::sign(client_config_, metadata);
 

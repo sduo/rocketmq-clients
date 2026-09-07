@@ -44,6 +44,9 @@ type ClientManager interface {
 	AckMessage(ctx context.Context, endpoints *v2.Endpoints, request *v2.AckMessageRequest, duration time.Duration) (*v2.AckMessageResponse, error)
 	ChangeInvisibleDuration(ctx context.Context, endpoints *v2.Endpoints, request *v2.ChangeInvisibleDurationRequest, duration time.Duration) (*v2.ChangeInvisibleDurationResponse, error)
 	ForwardMessageToDeadLetterQueue(ctx context.Context, endpoints *v2.Endpoints, request *v2.ForwardMessageToDeadLetterQueueRequest, duration time.Duration) (*v2.ForwardMessageToDeadLetterQueueResponse, error)
+	SyncLiteSubscription(ctx context.Context, endpoints *v2.Endpoints, request *v2.SyncLiteSubscriptionRequest, duration time.Duration) (*v2.SyncLiteSubscriptionResponse, error)
+	RecallMessage(ctx context.Context, endpoints *v2.Endpoints, request *v2.RecallMessageRequest, duration time.Duration) (*v2.RecallMessageResponse, error)
+	shutdown()
 }
 
 type clientManagerOptions struct {
@@ -346,6 +349,28 @@ func (cm *defaultClientManager) ForwardMessageToDeadLetterQueue(ctx context.Cont
 		return nil, err
 	}
 	ret, err := rpcClient.ForwardMessageToDeadLetterQueue(ctx, request)
+	cm.handleGrpcError(rpcClient, err)
+	return ret, err
+}
+func (cm *defaultClientManager) SyncLiteSubscription(ctx context.Context, endpoints *v2.Endpoints, request *v2.SyncLiteSubscriptionRequest,
+	duration time.Duration) (*v2.SyncLiteSubscriptionResponse, error) {
+	ctx, _ = context.WithTimeout(ctx, duration)
+	rpcClient, err := cm.getRpcClient(endpoints)
+	if err != nil {
+		return nil, err
+	}
+	ret, err := rpcClient.SyncLiteSubscription(ctx, request)
+	cm.handleGrpcError(rpcClient, err)
+	return ret, err
+}
+
+func (cm *defaultClientManager) RecallMessage(ctx context.Context, endpoints *v2.Endpoints, request *v2.RecallMessageRequest, duration time.Duration) (*v2.RecallMessageResponse, error) {
+	ctx, _ = context.WithTimeout(ctx, duration)
+	rpcClient, err := cm.getRpcClient(endpoints)
+	if err != nil {
+		return nil, err
+	}
+	ret, err := rpcClient.RecallMessage(ctx, request)
 	cm.handleGrpcError(rpcClient, err)
 	return ret, err
 }
